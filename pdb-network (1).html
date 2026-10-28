@@ -1,0 +1,1320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pampano — PDB Network Generator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1115; color: #e6e8eb; display: flex; height: 100vh; overflow: hidden;
+  }
+  #sidebar {
+    width: 340px; min-width: 340px; background: #171a21; padding: 20px;
+    overflow-y: auto; border-right: 1px solid #262b36;
+  }
+  #main { flex: 1; position: relative; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+  .brand img {
+    width: 40px; height: 40px; border-radius: 8px; object-fit: cover;
+    border: 1px solid #2c3340; background: #0f1115; flex-shrink: 0;
+  }
+  .brand .fallback {
+    width: 40px; height: 40px; border-radius: 8px; display: none;
+    align-items: center; justify-content: center; font-size: 22px;
+    border: 1px solid #2c3340; background: #11202b;
+  }
+  .sub { font-size: 12px; color: #8b93a1; margin-bottom: 20px; }
+  label { display: block; font-size: 12px; color: #9aa3b2; margin: 14px 0 5px; }
+  input[type=text], input[type=number], select {
+    width: 100%; padding: 8px 10px; background: #0f1115; border: 1px solid #2c3340;
+    border-radius: 6px; color: #e6e8eb; font-size: 13px;
+  }
+  input[type=file] { font-size: 12px; color: #9aa3b2; width: 100%; }
+  .row { display: flex; gap: 10px; }
+  .row > div { flex: 1; }
+  button {
+    width: 100%; margin-top: 18px; padding: 10px; background: #3b82f6; border: none;
+    border-radius: 6px; color: white; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #2563eb; }
+  button:disabled { background: #2c3340; cursor: not-allowed; }
+  button.secondary { background: #2c3340; margin-top: 8px; }
+  button.secondary:hover { background: #374151; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; background: #2c3340; margin: 2px 2px 0 0; }
+  #stats { margin-top: 16px; font-size: 12px; color: #9aa3b2; line-height: 1.7; }
+  #stats b { color: #e6e8eb; }
+  svg { width: 100%; height: 100%; display: block; }
+  .node circle { stroke: #0f1115; stroke-width: 1.5px; cursor: grab; }
+  .node text { font-size: 9px; fill: #cbd2dd; pointer-events: none; }
+  .link { stroke-opacity: 0.5; }
+  #tooltip {
+    position: absolute; pointer-events: none; background: #1f2530; border: 1px solid #374151;
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; opacity: 0; transition: opacity .1s;
+    max-width: 240px;
+  }
+  .legend { position: absolute; bottom: 14px; right: 14px; background: rgba(23,26,33,.9);
+    padding: 10px 12px; border-radius: 8px; font-size: 11px; border: 1px solid #262b36; }
+  #inset {
+    position: absolute; bottom: 14px; left: 14px; width: 280px;
+    background: rgba(17,20,27,.96); border: 1px solid #2c3340; border-radius: 10px;
+    overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.4);
+  }
+  #insetHeader {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 12px; background: #1b2029; font-size: 12px; font-weight: 600;
+    border-bottom: 1px solid #262b36;
+  }
+  #insetClose { cursor: pointer; color: #8b93a1; font-size: 16px; line-height: 1; }
+  #insetClose:hover { color: #e6e8eb; }
+  #insetCanvas { width: 280px; height: 220px; background: #0b0d11; cursor: grab; }
+  #insetInfo { padding: 8px 12px; font-size: 11px; color: #9aa3b2; line-height: 1.5; }
+  .legend div { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; }
+  details { margin-top: 10px; }
+  summary { font-size: 12px; color: #9aa3b2; cursor: pointer; }
+  .note { font-size: 11px; color: #6b7280; margin-top: 4px; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <div class="brand">
+    <img src="https://thumb.wikimedia.org/wikipedia/commons/thumb/1/1d/Pompano_common.jpg/500px-Pompano_common.jpg"
+         alt="Pompano fish"
+         onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
+    <span class="fallback">🐟</span>
+    <h1>Pampano</h1>
+  </div>
+  <div class="sub">Contacts &amp; bonds from structure</div>
+
+  <label>PDB file (upload)</label>
+  <input type="file" id="fileInput" accept=".pdb,.ent,.txt">
+
+  <label>…or fetch by PDB ID</label>
+  <div class="row">
+    <div><input type="text" id="pdbId" placeholder="e.g. 1CRN" maxlength="4"></div>
+    <div><button class="secondary" style="margin-top:0" id="fetchBtn">Fetch</button></div>
+  </div>
+
+  <label>Assembly</label>
+  <select id="assemblyMode">
+    <option value="monomer">Monomer (first chain)</option>
+    <option value="asym">Full asymmetric unit (all chains as-is)</option>
+    <option value="bioassembly">Biological assembly (apply BIOMT)</option>
+  </select>
+  <div class="note" id="asmNote"></div>
+
+  <label>Network granularity</label>
+  <select id="granularity">
+    <option value="residue">Residue-level (nodes = residues)</option>
+    <option value="atom">Atom-level (nodes = atoms)</option>
+  </select>
+
+  <label>Color nodes by</label>
+  <select id="colorBy">
+    <option value="chain">Chain</option>
+    <option value="hydrophobicity">Hydrophobicity (Kyte-Doolittle)</option>
+    <option value="sasa">Surface accessibility (SASA)</option>
+    <option value="restype">Residue type (charge/polarity)</option>
+    <option value="degree">Degree (contact count)</option>
+  </select>
+
+  <label>Size nodes by</label>
+  <select id="sizeBy">
+    <option value="uniform">Uniform</option>
+    <option value="size">Residue size (volume)</option>
+    <option value="sasa">Surface accessibility (SASA)</option>
+    <option value="degree">Degree (contact count)</option>
+  </select>
+
+  <div class="row">
+    <div>
+      <label>Contact cutoff (Å)</label>
+      <input type="number" id="cutoff" value="5.0" step="0.5" min="1">
+    </div>
+    <div>
+      <label>Atoms</label>
+      <select id="atomScope">
+        <option value="all">All atoms</option>
+        <option value="heavy" selected>Heavy only</option>
+        <option value="ca">CA/representative</option>
+      </select>
+    </div>
+  </div>
+
+  <details>
+    <summary>Advanced</summary>
+    <label><input type="checkbox" id="covalentOnly"> Covalent bonds only (~1.9 Å)</label>
+    <label><input type="checkbox" id="intraChain" checked> Include intra-chain contacts</label>
+    <label><input type="checkbox" id="interChain" checked> Include inter-chain contacts (A↔B)</label>
+    <label><input type="checkbox" id="interProtomer" checked> Include inter-protomer contacts (A↔A′, bio-assembly)</label>
+    <label>Protomer groups (optional)</label>
+    <input type="text" id="protomerGroups" placeholder="e.g. A,B ; C,D">
+    <div class="note">Group chains into protomers to distinguish within-protomer from between-protomer interfaces. Chains in the same group → "intra-protomer". Leave blank to classify inter-chain contacts automatically by exact sequence (homotypic = same sequence, heterotypic = different).</div>
+    <label><input type="checkbox" id="excludeSeqAdj" checked> Exclude sequential neighbors (residue mode)</label>
+    <label><input type="checkbox" id="includeHetatm"> Include HETATM (ligands/water)</label>
+  </details>
+
+  <label>Show edges</label>
+  <select id="edgeFilter">
+    <option value="all">All (bonds + contacts)</option>
+    <option value="bonds">Bonds only (covalent)</option>
+    <option value="contacts">Contacts only (non-covalent)</option>
+    <option value="peptide">Peptide bonds</option>
+    <option value="disulfide">Disulfide bonds</option>
+    <option value="salt_bridge">Salt bridges</option>
+    <option value="hydrogen_bond">Hydrogen bonds</option>
+    <option value="hydrophobic">Hydrophobic</option>
+    <option value="scope_intra">Scope: intra-chain</option>
+    <option value="scope_intra_protomer">Scope: intra-protomer (grouped)</option>
+    <option value="scope_homotypic">Scope: homotypic (A↔B, same seq)</option>
+    <option value="scope_heterotypic">Scope: heterotypic (A↔B, diff seq)</option>
+    <option value="scope_inter_protomer">Scope: inter-protomer (A↔A′)</option>
+  </select>
+
+  <label>Color edges by</label>
+  <select id="edgeColorBy">
+    <option value="type">Interaction type</option>
+    <option value="scope">Contact scope (intra / inter-chain / inter-protomer)</option>
+    <option value="chain">Intra / inter (combined)</option>
+  </select>
+  <div class="note">H-bonds use donor–acceptor angle geometry. If the structure has explicit hydrogens, choose "All atoms" scope for the stricter D–H···A angle; otherwise a heavy-atom angle criterion is used.</div>
+
+  <button id="buildBtn" disabled>Build Network</button>
+  <button class="secondary" id="exportBtn" disabled>Export edges (CSV)</button>
+  <button class="secondary" id="exportJsonBtn" disabled>Export graph (JSON)</button>
+
+  <div id="stats"></div>
+</div>
+
+<div id="main">
+  <svg id="graph"></svg>
+  <div id="tooltip"></div>
+  <div class="legend" id="legend" style="display:none"></div>
+  <div id="inset" style="display:none">
+    <div id="insetHeader">
+      <span id="insetTitle">Residue view</span>
+      <span id="insetClose" title="Close">×</span>
+    </div>
+    <div id="insetCanvas"></div>
+    <div id="insetInfo"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let parsed = null;   // {atoms, biomt}
+let graph = null;    // {nodes, links}
+let sceneAtoms = null;    // prepared+selected atom list used for the current graph
+let resAtomIndex = null;  // Map(residue node title/key -> [atom objects]) for 3D inset
+
+// ---------- residue property tables ----------
+// Kyte-Doolittle hydropathy (higher = more hydrophobic)
+const KD = {ILE:4.5,VAL:4.2,LEU:3.8,PHE:2.8,CYS:2.5,MET:1.9,ALA:1.8,GLY:-0.4,
+  THR:-0.7,SER:-0.8,TRP:-0.9,TYR:-1.3,PRO:-1.6,HIS:-3.2,GLU:-3.5,GLN:-3.5,
+  ASP:-3.5,ASN:-3.5,LYS:-3.9,ARG:-4.5};
+// residue volume (Å³, Zamyatnin)
+const VOL = {GLY:60.1,ALA:88.6,SER:89.0,CYS:108.5,ASP:111.1,PRO:112.7,ASN:114.1,
+  THR:116.1,GLU:138.4,VAL:140.0,GLN:143.8,HIS:153.2,MET:162.9,ILE:166.7,LEU:166.7,
+  LYS:168.6,ARG:173.4,PHE:189.9,TYR:193.6,TRP:227.8};
+// Tien et al. max SASA (Å²) for relative accessibility
+const MAXASA = {ALA:129,ARG:274,ASN:195,ASP:193,CYS:167,GLU:223,GLN:225,GLY:104,
+  HIS:224,ILE:197,LEU:201,LYS:236,MET:224,PHE:240,PRO:159,SER:155,THR:172,
+  TRP:285,TYR:263,VAL:174};
+// charge/polarity class
+const RESCLASS = {ASP:"neg",GLU:"neg", LYS:"pos",ARG:"pos",HIS:"pos",
+  SER:"polar",THR:"polar",ASN:"polar",GLN:"polar",TYR:"polar",CYS:"polar",
+  GLY:"special",PRO:"special",
+  ALA:"hydrophobic",VAL:"hydrophobic",LEU:"hydrophobic",ILE:"hydrophobic",
+  MET:"hydrophobic",PHE:"hydrophobic",TRP:"hydrophobic"};
+const CLASSCOLOR = {neg:"#ef4444", pos:"#3b82f6", polar:"#10b981",
+  hydrophobic:"#f59e0b", special:"#a855f7", unknown:"#6b7280"};
+// van der Waals radii (Å)
+const VDW = {C:1.70, N:1.55, O:1.52, S:1.80, P:1.80, H:1.20, F:1.47,
+  CL:1.75, BR:1.85, I:1.98, FE:2.0, ZN:1.39, MG:1.73, CA:2.31, NA:2.27};
+function vdw(el){ return VDW[el] || 1.70; }
+
+// ---------- Shrake-Rupley SASA ----------
+// approximate per-atom solvent accessible surface area, summed to residues
+function computeSASA(atoms, probe=1.4, nSphere=92) {
+  // Fibonacci sphere sample points
+  const pts = [];
+  const gr = Math.PI * (3 - Math.sqrt(5));
+  for (let i=0;i<nSphere;i++){
+    const y = 1 - (i/(nSphere-1))*2, r = Math.sqrt(1-y*y), th = gr*i;
+    pts.push([Math.cos(th)*r, y, Math.sin(th)*r]);
+  }
+  // spatial grid for neighbor lookup
+  const maxR = 2.0 + probe*2 + 2.0;
+  const cell = maxR, grid = new Map();
+  const key=(i,j,k)=>i+","+j+","+k;
+  atoms.forEach((a,idx)=>{
+    const k=key(Math.floor(a.x/cell),Math.floor(a.y/cell),Math.floor(a.z/cell));
+    if(!grid.has(k)) grid.set(k,[]); grid.get(k).push(idx);
+  });
+  const sasa = new Array(atoms.length).fill(0);
+  atoms.forEach((a,idx)=>{
+    const ri = vdw(a.element)+probe;
+    // gather neighbors
+    const ci=Math.floor(a.x/cell),cj=Math.floor(a.y/cell),ck=Math.floor(a.z/cell);
+    const neigh=[];
+    for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++)for(let dk=-1;dk<=1;dk++){
+      const b=grid.get(key(ci+di,cj+dj,ck+dk)); if(b) for(const n of b) if(n!==idx) neigh.push(n);
+    }
+    let accessible=0;
+    for(const p of pts){
+      const px=a.x+ri*p[0], py=a.y+ri*p[1], pz=a.z+ri*p[2];
+      let buried=false;
+      for(const n of neigh){
+        const b=atoms[n], rj=vdw(b.element)+probe;
+        const dx=px-b.x,dy=py-b.y,dz=pz-b.z;
+        if(dx*dx+dy*dy+dz*dz < rj*rj){ buried=true; break; }
+      }
+      if(!buried) accessible++;
+    }
+    sasa[idx] = (accessible/nSphere) * 4*Math.PI*ri*ri;
+  });
+  return sasa; // per-atom Å²
+}
+
+// ---------- PDB parsing ----------
+function parsePDB(text) {
+  const atoms = [];
+  const biomt = []; // list of {matrix:[[..],[..],[..]], trans:[x,y,z]} per operator
+  let curOp = null;
+  const lines = text.split(/\r?\n/);
+
+  for (const line of lines) {
+    const rec = line.slice(0, 6);
+
+    if (rec === "ATOM  " || rec === "HETATM") {
+      // Columns per PDB spec (1-indexed in spec; here 0-indexed slices)
+      const atom = {
+        hetatm: rec === "HETATM",
+        serial: parseInt(line.slice(6, 11)),
+        name: line.slice(12, 16).trim(),
+        altLoc: line.slice(16, 17).trim(),
+        resName: line.slice(17, 20).trim(),
+        chain: line.slice(21, 22).trim() || "A",
+        resSeq: parseInt(line.slice(22, 26)),
+        iCode: line.slice(26, 27).trim(),
+        x: parseFloat(line.slice(30, 38)),
+        y: parseFloat(line.slice(38, 46)),
+        z: parseFloat(line.slice(46, 54)),
+        element: (line.slice(76, 78).trim() || line.slice(12, 14).trim().replace(/[0-9]/g, "")).toUpperCase()
+      };
+      // keep only first altLoc
+      if (atom.altLoc === "" || atom.altLoc === "A") atoms.push(atom);
+    }
+    // REMARK 350 BIOMT records for biological assembly
+    else if (rec === "REMARK" && line.slice(11, 18).trim() === "BIOMT1") {
+      curOp = { matrix: [[0,0,0],[0,0,0],[0,0,0]], trans: [0,0,0] };
+    }
+    if (rec === "REMARK" && /BIOMT[123]/.test(line.slice(11, 20))) {
+      const which = parseInt(line.slice(18, 19)) - 1; // row 0..2
+      const nums = line.slice(23).trim().split(/\s+/).map(Number);
+      // nums = [opNo, m1, m2, m3, t]
+      if (nums.length >= 5 && which >= 0 && which <= 2) {
+        if (which === 0 && !curOp) curOp = { matrix: [[0,0,0],[0,0,0],[0,0,0]], trans: [0,0,0] };
+        if (curOp) {
+          curOp.matrix[which] = [nums[1], nums[2], nums[3]];
+          curOp.trans[which] = nums[4];
+          if (which === 2) { biomt.push(curOp); curOp = null; }
+        }
+      }
+    }
+  }
+  return { atoms, biomt };
+}
+
+function applyBiomt(atoms, biomt) {
+  if (!biomt.length) return atoms.map(a => ({...a, opId: 0, baseChain: a.chain}));
+  const out = [];
+  biomt.forEach((op, oi) => {
+    const [r0, r1, r2] = op.matrix, t = op.trans;
+    for (const a of atoms) {
+      out.push({
+        ...a, opId: oi, baseChain: a.chain,
+        x: r0[0]*a.x + r0[1]*a.y + r0[2]*a.z + t[0],
+        y: r1[0]*a.x + r1[1]*a.y + r1[2]*a.z + t[1],
+        z: r2[0]*a.x + r2[1]*a.y + r2[2]*a.z + t[2],
+        chain: oi === 0 ? a.chain : a.chain + "_" + oi
+      });
+    }
+  });
+  return out;
+}
+
+// ---------- atom selection ----------
+function selectAtoms(atoms, opts) {
+  let a = atoms;
+  if (!opts.includeHetatm) a = a.filter(x => !x.hetatm);
+  if (opts.atomScope === "heavy") a = a.filter(x => x.element !== "H" && x.element !== "D");
+  if (opts.atomScope === "ca") {
+    a = a.filter(x => x.name === "CA" || x.name === "P" || (x.hetatm && x.element !== "H"));
+  }
+  return a;
+}
+
+// ---------- spatial grid for neighbor search ----------
+function buildContacts(atoms, cutoff) {
+  const cell = cutoff, grid = new Map();
+  const key = (i,j,k) => i+","+j+","+k;
+  atoms.forEach((a, idx) => {
+    const i = Math.floor(a.x/cell), j = Math.floor(a.y/cell), k = Math.floor(a.z/cell);
+    const kk = key(i,j,k);
+    if (!grid.has(kk)) grid.set(kk, []);
+    grid.get(kk).push(idx);
+  });
+  const c2 = cutoff*cutoff, pairs = [];
+  atoms.forEach((a, idx) => {
+    const i = Math.floor(a.x/cell), j = Math.floor(a.y/cell), k = Math.floor(a.z/cell);
+    for (let di=-1; di<=1; di++) for (let dj=-1; dj<=1; dj++) for (let dk=-1; dk<=1; dk++) {
+      const bucket = grid.get(key(i+di,j+dj,k+dk));
+      if (!bucket) continue;
+      for (const jdx of bucket) {
+        if (jdx <= idx) continue;
+        const b = atoms[jdx];
+        const dx=a.x-b.x, dy=a.y-b.y, dz=a.z-b.z, d2=dx*dx+dy*dy+dz*dz;
+        if (d2 <= c2) pairs.push([idx, jdx, Math.sqrt(d2)]);
+      }
+    }
+  });
+  return pairs;
+}
+
+// when a residue edge aggregates atom pairs of differing scope, keep the most
+// "notable" one (interface contacts rank above internal ones)
+const SCOPE_RANK = ["heterotypic","homotypic","inter_protomer","intra_protomer","intra"];
+function mergeScoperank(a, b) {
+  if (!a) return b; if (!b) return a;
+  return SCOPE_RANK.indexOf(a) <= SCOPE_RANK.indexOf(b) ? a : b;
+}
+
+// ---------- chain sequence fingerprinting ----------
+// Build a per-chain sequence string (by baseChain) so we can tell whether two
+// different chains are the same protein (homotypic) or different (heterotypic).
+const THREE_TO_ONE = {ALA:"A",ARG:"R",ASN:"N",ASP:"D",CYS:"C",GLN:"Q",GLU:"E",
+  GLY:"G",HIS:"H",ILE:"I",LEU:"L",LYS:"K",MET:"M",PHE:"F",PRO:"P",SER:"S",
+  THR:"T",TRP:"W",TYR:"Y",VAL:"V",MSE:"M",SEC:"U",PYL:"O"};
+
+function chainSequences(atoms) {
+  // collect ordered residues per baseChain (use CA presence to mark a residue)
+  const byChain = new Map();
+  for (const a of atoms) {
+    if (a.hetatm) continue;
+    const bc = a.baseChain;
+    if (!byChain.has(bc)) byChain.set(bc, new Map());
+    const resKey = a.resSeq + "|" + a.iCode;
+    if (!byChain.get(bc).has(resKey))
+      byChain.get(bc).set(resKey, {resSeq:a.resSeq, iCode:a.iCode, resName:a.resName});
+  }
+  const seqs = new Map();
+  for (const [bc, resMap] of byChain) {
+    const res = [...resMap.values()].sort((x,y)=>
+      x.resSeq - y.resSeq || x.iCode.localeCompare(y.iCode));
+    seqs.set(bc, res.map(r => THREE_TO_ONE[r.resName] || "X").join(""));
+  }
+  return seqs;
+}
+
+// group baseChains by exact sequence identity.
+// Two chains of the same protein in one structure share an identical sequence string;
+// different chains differ. Exact comparison can't misclassify, so no fuzzy matching.
+// returns Map(baseChain -> clusterId)
+function clusterChainsBySequence(seqs) {
+  const seqToId = new Map();
+  const cluster = new Map();
+  let next = 0;
+  for (const [chain, seq] of seqs) {
+    if (!seqToId.has(seq)) seqToId.set(seq, next++);
+    cluster.set(chain, seqToId.get(seq));
+  }
+  return cluster;
+}
+
+// classify the structural scope of a contact between two atoms:
+//  intra        — same chain copy (same baseChain + same opId)
+//  inter_chain  — different base chains (e.g. A↔B), same or any operator
+//  inter_protomer — same base chain, different symmetry operator (A↔A_1)
+function contactScope(a, b) {
+  const sameBase = a.baseChain === b.baseChain;
+  const sameOp = (a.opId ?? 0) === (b.opId ?? 0);
+  if (sameBase && sameOp) return "intra";
+  if (!sameBase) return "inter_chain";
+  return "inter_protomer"; // same base chain, different operator
+}
+
+// ---------- bond / interaction classification ----------
+function isCovalent(elA, elB, d) {
+  if (elA === "S" && elB === "S") return d <= 2.4;   // disulfide ~2.05 Å
+  return d <= 1.95;                                   // generic covalent ceiling
+}
+
+// vector helpers
+function vsub(a,b){ return [a.x-b.x, a.y-b.y, a.z-b.z]; }
+function vdot(u,v){ return u[0]*v[0]+u[1]*v[1]+u[2]*v[2]; }
+function vlen(u){ return Math.sqrt(vdot(u,u)); }
+// angle (degrees) at vertex V between points P and Q
+function angleAt(V, P, Q) {
+  const u = vsub(P,V), w = vsub(Q,V);
+  const denom = vlen(u)*vlen(w);
+  if (denom === 0) return 0;
+  let c = vdot(u,w)/denom;
+  c = Math.max(-1, Math.min(1, c));
+  return Math.acos(c) * 180/Math.PI;
+}
+
+// Build covalent-antecedent map: for each atom index, the atoms bonded to it.
+// Used to find the acceptor's antecedent (AA) and donor's antecedent for H-bond geometry.
+// Also records bonded hydrogens separately so we can use true D–H···A angle when H is present.
+function buildAntecedents(atoms) {
+  const cell = 2.0, grid = new Map();
+  const key=(i,j,k)=>i+","+j+","+k;
+  atoms.forEach((a,idx)=>{
+    const k=key(Math.floor(a.x/cell),Math.floor(a.y/cell),Math.floor(a.z/cell));
+    if(!grid.has(k)) grid.set(k,[]); grid.get(k).push(idx);
+  });
+  const ante = atoms.map(()=>[]);      // bonded heavy atoms
+  const hydro = atoms.map(()=>[]);     // bonded hydrogens
+  atoms.forEach((a,idx)=>{
+    const ci=Math.floor(a.x/cell),cj=Math.floor(a.y/cell),ck=Math.floor(a.z/cell);
+    for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++)for(let dk=-1;dk<=1;dk++){
+      const b=grid.get(key(ci+di,cj+dj,ck+dk)); if(!b) continue;
+      for(const n of b){
+        if(n===idx) continue;
+        const o=atoms[n];
+        const dx=a.x-o.x,dy=a.y-o.y,dz=a.z-o.z, d2=dx*dx+dy*dy+dz*dz;
+        const isH = (o.element==="H"||o.element==="D");
+        if (a.element==="H"||a.element==="D") continue; // index atom is H; skip (handled from heavy side)
+        if (isH) { if (d2 <= 1.3*1.3) hydro[idx].push(n); }   // X–H ~1.0 Å
+        else     { if (d2 <= 1.95*1.95) ante[idx].push(n); }
+      }
+    }
+  });
+  return {ante, hydro};
+}
+
+// charged atom groups for salt bridges
+const POS_ATOMS = { // basic side-chain N
+  ARG: ["NH1","NH2","NE"], LYS: ["NZ"], HIS: ["ND1","NE2"]
+};
+const NEG_ATOMS = { // acidic side-chain O
+  ASP: ["OD1","OD2"], GLU: ["OE1","OE2"]
+};
+// H-bond donor/acceptor heavy atoms (simplified)
+const HBOND_DONORS = new Set(["N","O"]);     // by element; backbone N, side-chain N/O
+const HBOND_ACCEPTORS = new Set(["O","N"]);  // backbone O, side-chain O/N
+function isCharged(resName, atomName, sign) {
+  const t = sign === "+" ? POS_ATOMS : NEG_ATOMS;
+  return t[resName] && t[resName].includes(atomName);
+}
+// hydrophobic carbons: side-chain C not adjacent to polar groups (approx: any C in hydrophobic residue, or any side-chain C)
+const HYDROPHOBIC_RES = new Set(["ALA","VAL","LEU","ILE","MET","PHE","TRP","PRO","CYS"]);
+
+// is this atom pair the backbone peptide bond? (C of one residue — N of the next)
+// In CA-only selections, fall back to CA(i)–CA(i+1) adjacency (~3.8 Å).
+function isPeptideBond(a, b) {
+  if (a.chain !== b.chain) return false;
+  if (a.resSeq === b.resSeq) return false;
+  // true backbone C–N linkage
+  if ((a.name==="C" && b.name==="N") || (a.name==="N" && b.name==="C")) return true;
+  // CA-only fallback: consecutive residues within virtual-bond distance
+  if (a.name==="CA" && b.name==="CA" && Math.abs(a.resSeq - b.resSeq) === 1) return true;
+  return false;
+}
+
+// classify a single atom pair interaction; returns a type string
+// geom = {ante, hydro} bonded-atom maps; ia,ib = atom indices into `atoms`
+function classifyInteraction(a, b, d, atoms, geom, ia, ib) {
+  // salt bridge: oppositely charged groups within 4.0 Å
+  if (d <= 4.0) {
+    if ((isCharged(a.resName,a.name,"+") && isCharged(b.resName,b.name,"-")) ||
+        (isCharged(a.resName,a.name,"-") && isCharged(b.resName,b.name,"+")))
+      return "salt_bridge";
+  }
+  // hydrogen bond: N/O ... N/O within 3.5 Å, with angle geometry check
+  if (d <= 3.5) {
+    const aPolar = (a.element === "N" || a.element === "O");
+    const bPolar = (b.element === "N" || b.element === "O");
+    if (aPolar && bPolar && hbondGeometryOK(atoms, geom, ia, ib))
+      return "hydrogen_bond";
+  }
+  // hydrophobic: carbon-carbon in hydrophobic context within 4.0 Å
+  if (d <= 4.0 && a.element === "C" && b.element === "C" &&
+      (HYDROPHOBIC_RES.has(a.resName) || HYDROPHOBIC_RES.has(b.resName)))
+    return "hydrophobic";
+  return "vdw";
+}
+
+// H-bond geometry check.
+// If explicit H present on a donor: require D–H···A angle >= 120° (near-linear).
+// Otherwise (no H): require acceptor-side D···A–AA angle >= 90°.
+const HBOND_DHA_MIN = 120;   // donor–H–acceptor, explicit H
+const HBOND_DAAA_MIN = 90;   // donor···acceptor–antecedent, heavy-atom only
+function hbondGeometryOK(atoms, geom, ia, ib) {
+  const {ante, hydro} = geom;
+  // explicit-H path: does either atom have an H pointing at the other?
+  const dhaOK = (donIdx, accIdx) => {
+    const hs = hydro[donIdx];
+    if (!hs || hs.length === 0) return null; // no H on this donor → can't use this path
+    const acc = atoms[accIdx];
+    return hs.some(h => angleAt(atoms[h], atoms[donIdx], acc) >= HBOND_DHA_MIN);
+  };
+  const r1 = dhaOK(ia, ib), r2 = dhaOK(ib, ia);
+  if (r1 !== null || r2 !== null) return (r1 === true) || (r2 === true);
+
+  // heavy-atom fallback: donor approaches acceptor from lone-pair side
+  const okAsAcceptor = (accIdx, donIdx) => {
+    const antes = ante[accIdx];
+    if (!antes || antes.length === 0) return true; // can't test; don't reject
+    const acc = atoms[accIdx], don = atoms[donIdx];
+    return antes.some(aaIdx => angleAt(acc, don, atoms[aaIdx]) >= HBOND_DAAA_MIN);
+  };
+  return okAsAcceptor(ib, ia) || okAsAcceptor(ia, ib);
+}
+
+// priority when collapsing many atom-pair interactions into one residue edge
+const INTERACTION_PRIORITY = ["disulfide","peptide","covalent","salt_bridge","hydrogen_bond","hydrophobic","vdw"];
+function strongerInteraction(a, b) {
+  if (!a) return b; if (!b) return a;
+  return INTERACTION_PRIORITY.indexOf(a) <= INTERACTION_PRIORITY.indexOf(b) ? a : b;
+}
+
+// does this scope pass the include/exclude option checkboxes?
+function scopeIncluded(scope, opts) {
+  if (scope === "intra") return opts.intraChain;
+  if (scope === "intra_protomer") return opts.interChain; // within a manual protomer = chain-chain
+  if (scope === "homotypic" || scope === "heterotypic") return opts.interChain;
+  if (scope === "inter_protomer") return opts.interProtomer;
+  return true;
+}
+
+// ---------- build graph ----------
+function buildGraph(atoms, opts) {
+  const effCutoff = opts.covalentOnly ? 1.9 : opts.cutoff;
+  const sel = selectAtoms(atoms, opts);
+  const pairs = buildContacts(sel, effCutoff);
+
+  // bonded-atom maps for H-bond angle geometry
+  // (skip if covalent-only or CA mode — no meaningful geometry there)
+  const needGeom = !opts.covalentOnly && opts.atomScope !== "ca";
+  const geom = needGeom ? buildAntecedents(sel) : {ante: sel.map(()=>[]), hydro: sel.map(()=>[])};
+
+  // scope context: sequence clusters + optional manual protomer groups
+  const seqs = chainSequences(atoms);
+  const cluster = clusterChainsBySequence(seqs);
+  const ctx = { cluster, groups: opts.protomerGroups || null };
+
+  // SASA needed? compute per-atom on heavy atoms, then map back onto sel
+  let atomSASA = null;
+  const needSASA = opts.colorBy === "sasa" || opts.sizeBy === "sasa";
+  if (needSASA) {
+    const heavy = sel.filter(a => a.element !== "H" && a.element !== "D");
+    const s = computeSASA(heavy);
+    atomSASA = new Map();
+    heavy.forEach((a,i)=> atomSASA.set(a, s[i]));
+  }
+
+  if (opts.granularity === "atom") {
+    const nodes = sel.map((a,i) => ({
+      id: i, label: a.name,
+      group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId,
+      resName: a.resName, resSeq: a.resSeq, iCode: a.iCode, atomRef: a,
+      hydro: KD[a.resName] ?? null,
+      vol: VOL[a.resName] ?? null,
+      sasa: atomSASA ? (atomSASA.get(a) ?? 0) : null,
+      relsasa: null,
+      resclass: RESCLASS[a.resName] || "unknown",
+      title: `${a.chain} ${a.resName}${a.resSeq} ${a.name}`
+    }));
+    const links = pairs.filter(([i,j]) => {
+      const scope = contactScope(sel[i], sel[j], ctx);
+      return scopeIncluded(scope, opts);
+    }).map(([i,j,d]) => {
+      const a = sel[i], b = sel[j];
+      const scope = contactScope(a, b, ctx);
+      const peptide = isPeptideBond(a, b);
+      const covalent = isCovalent(a.element, b.element, d) || peptide;
+      let type;
+      if (peptide) type = "peptide";
+      else if (isCovalent(a.element, b.element, d))
+        type = (a.element==="S" && b.element==="S") ? "disulfide" : "covalent";
+      else type = classifyInteraction(a, b, d, sel, geom, i, j);
+      return {source:i, target:j, dist:d, scope,
+        inter: scope !== "intra", bond: covalent, type};
+    });
+    sceneAtoms = sel;
+    resAtomIndex = new Map();
+    for (const a of sel) {
+      const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}`;
+      if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
+      resAtomIndex.get(k).push(a);
+    }
+    nodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq}|${n.iCode||""}|${n.resName}`; });
+    return {nodes, links, meta:{seqs, cluster}};
+  }
+
+  // residue-level: collapse pairs to residue-residue
+  const resKey = a => `${a.chain}|${a.resSeq}|${a.iCode}|${a.resName}`;
+  const resMap = new Map();
+  sel.forEach(a => {
+    const k = resKey(a);
+    if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, baseChain:a.baseChain,
+      opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, sasa:0});
+    if (atomSASA && atomSASA.has(a)) resMap.get(k).sasa += atomSASA.get(a);
+  });
+  const resList = [...resMap.values()];
+  const resIndex = new Map(resList.map((r,i)=>[r.key,i]));
+
+  const edgeAgg = new Map(); // "i-j" -> {count, minDist}
+  for (const [i,j,d] of pairs) {
+    const ri = resIndex.get(resKey(sel[i])), rj = resIndex.get(resKey(sel[j]));
+    if (ri === rj) continue;
+    const a = resList[ri], b = resList[rj];
+    const sameChain = a.chain === b.chain;
+    if (sameChain && !opts.intraChain) continue;
+    if (!sameChain && !opts.interChain) continue;
+    if (opts.excludeSeqAdj && sameChain && Math.abs(a.resSeq - b.resSeq) <= 1) continue;
+    const lo = Math.min(ri,rj), hi = Math.max(ri,rj), ek = lo+"-"+hi;
+    if (!edgeAgg.has(ek)) edgeAgg.set(ek, {source:lo, target:hi, count:0, dist:Infinity,
+      inter: !sameChain, bond:false});
+    const e = edgeAgg.get(ek); e.count++; e.dist = Math.min(e.dist, d);
+    if (isCovalent(sel[i].element, sel[j].element, d)) e.bond = true;
+  }
+
+  const nodes = resList.map((r,i)=>({
+    id:i, label:`${r.resName}${r.resSeq}`, group:r.chain, chain:r.chain,
+    baseChain:r.baseChain, opId:r.opId,
+    resName:r.resName, resSeq:r.resSeq, iCode:r.iCode,
+    hydro: KD[r.resName] ?? null,
+    vol: VOL[r.resName] ?? null,
+    sasa: needSASA ? r.sasa : null,
+    relsasa: needSASA && MAXASA[r.resName] ? Math.min(r.sasa/MAXASA[r.resName],1) : null,
+    resclass: RESCLASS[r.resName] || "unknown",
+    title:`${r.chain} ${r.resName} ${r.resSeq}${r.iCode}`
+  }));
+  const links = [...edgeAgg.values()];
+  // drop isolated nodes
+  const used = new Set();
+  links.forEach(l => { used.add(l.source); used.add(l.target); });
+  const remap = new Map(); let n=0;
+  const fnodes = nodes.filter(nd => used.has(nd.id)).map(nd => { remap.set(nd.id, n); return {...nd, id:n++}; });
+  const flinks = links.map(l => ({...l, source:remap.get(l.source), target:remap.get(l.target)}));
+
+  // index atoms per residue node for the 3D inset
+  sceneAtoms = sel;
+  resAtomIndex = new Map();
+  for (const a of sel) {
+    const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}`;
+    if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
+    resAtomIndex.get(k).push(a);
+  }
+  fnodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq||""}|${n.iCode||""}|${n.resName}`; });
+
+  return {nodes:fnodes, links:flinks, meta:{seqs, cluster}};
+}
+
+// ---------- rendering ----------
+let sim = null;
+const idOf = x => (x && typeof x === "object") ? x.id : x;
+function render(g, opts) {
+  const svg = d3.select("#graph");
+  svg.selectAll("*").remove();
+  // a re-render invalidates any prior selection styling
+  if (selectedNodeId !== null) { selectedNodeId = null; $("inset").style.display = "none"; }
+  const W = svg.node().clientWidth, H = svg.node().clientHeight;
+
+  // edge type filter
+  const BOND_TYPES = new Set(["peptide","disulfide","covalent"]);
+  let shownLinks = g.links;
+  const ef = opts.edgeFilter;
+  if (ef === "bonds") shownLinks = g.links.filter(l => l.bond);
+  else if (ef === "contacts") shownLinks = g.links.filter(l => !l.bond);
+  else if (ef === "scope_intra") shownLinks = g.links.filter(l => l.scope === "intra");
+  else if (ef === "scope_intra_protomer") shownLinks = g.links.filter(l => l.scope === "intra_protomer");
+  else if (ef === "scope_homotypic") shownLinks = g.links.filter(l => l.scope === "homotypic");
+  else if (ef === "scope_heterotypic") shownLinks = g.links.filter(l => l.scope === "heterotypic");
+  else if (ef === "scope_inter_protomer") shownLinks = g.links.filter(l => l.scope === "inter_protomer");
+  else if (ef !== "all") shownLinks = g.links.filter(l => l.type === ef);
+
+  // compute degree (from shown links)
+  const deg = new Array(g.nodes.length).fill(0);
+  shownLinks.forEach(l => { deg[idOf(l.source)]++; deg[idOf(l.target)]++; });
+  g.nodes.forEach((n,i)=> n.degree = deg[i]);
+
+  const chains = [...new Set(g.nodes.map(n=>n.chain))];
+  const chainColor = d3.scaleOrdinal(d3.schemeTableau10).domain(chains);
+
+  // ----- color scale -----
+  let colorFn, legendItems, legendTitle;
+  const cb = opts.colorBy;
+  if (cb === "hydrophobicity") {
+    const sc = d3.scaleSequential(d3.interpolateRdYlBu).domain([4.5,-4.5]); // red=hydrophobic
+    colorFn = n => n.hydro==null ? "#6b7280" : sc(n.hydro);
+    legendTitle = "Hydrophobicity";
+    legendItems = [["#a50026","hydrophobic (+4.5)"],["#ffffbf","neutral (0)"],["#313695","hydrophilic (−4.5)"]];
+  } else if (cb === "sasa") {
+    const vals = g.nodes.map(n=>n.relsasa ?? n.sasa ?? 0);
+    const mx = d3.max(vals)||1;
+    const useRel = g.nodes.some(n=>n.relsasa!=null);
+    const sc = d3.scaleSequential(d3.interpolateViridis).domain([0, useRel?1:mx]);
+    colorFn = n => sc(useRel ? (n.relsasa??0) : (n.sasa??0));
+    legendTitle = "Surface accessibility";
+    legendItems = [[d3.interpolateViridis(1),"exposed"],[d3.interpolateViridis(0.5),"partial"],[d3.interpolateViridis(0),"buried"]];
+  } else if (cb === "restype") {
+    colorFn = n => CLASSCOLOR[n.resclass] || CLASSCOLOR.unknown;
+    legendTitle = "Residue type";
+    legendItems = [["#ef4444","acidic (−)"],["#3b82f6","basic (+)"],["#10b981","polar"],
+      ["#f59e0b","hydrophobic"],["#a855f7","Gly/Pro"]];
+  } else if (cb === "degree") {
+    const mx = d3.max(deg)||1;
+    const sc = d3.scaleSequential(d3.interpolateYlOrRd).domain([0,mx]);
+    colorFn = n => sc(n.degree);
+    legendTitle = "Degree";
+    legendItems = [[d3.interpolateYlOrRd(1),`high (${mx})`],[d3.interpolateYlOrRd(0.4),"mid"],[d3.interpolateYlOrRd(0),"low (0)"]];
+  } else {
+    colorFn = n => chainColor(n.chain);
+    legendTitle = "Chain";
+    legendItems = chains.map(c=>[chainColor(c),"chain "+c]);
+  }
+
+  // ----- size scale -----
+  let sizeFn;
+  const sb = opts.sizeBy, baseR = g.nodes.length > 400 ? 4 : 6;
+  if (sb === "size") {
+    const sc = d3.scaleSqrt().domain([60,228]).range([3,12]);
+    sizeFn = n => n.vol==null ? baseR : sc(n.vol);
+  } else if (sb === "sasa") {
+    const vals = g.nodes.map(n=>n.sasa??0); const mx=d3.max(vals)||1;
+    const sc = d3.scaleSqrt().domain([0,mx]).range([3,13]);
+    sizeFn = n => sc(n.sasa??0);
+  } else if (sb === "degree") {
+    const mx=d3.max(deg)||1;
+    const sc = d3.scaleSqrt().domain([0,mx]).range([3,14]);
+    sizeFn = n => sc(n.degree);
+  } else {
+    sizeFn = () => baseR;
+  }
+  g.nodes.forEach(n => n.r = sizeFn(n));
+
+  const zoomG = svg.append("g");
+  svg.call(d3.zoom().scaleExtent([0.1, 8]).on("zoom", e => zoomG.attr("transform", e.transform)));
+
+  // interaction-type colors
+  const EDGE_COLORS = {
+    peptide:"#22d3ee", disulfide:"#eab308", covalent:"#67e8f9",
+    salt_bridge:"#ef4444", hydrogen_bond:"#3b82f6",
+    hydrophobic:"#f59e0b", vdw:"#4b5563"
+  };
+  const SCOPE_COLORS = { intra:"#4b5563", intra_protomer:"#14b8a6",
+    homotypic:"#f59e0b", heterotypic:"#ec4899", inter_protomer:"#a855f7" };
+  const edgeColor = d => {
+    if (opts.edgeColorBy === "chain") return d.inter ? "#f59e0b" : "#4b5563";
+    if (opts.edgeColorBy === "scope") return SCOPE_COLORS[d.scope] || "#4b5563";
+    return EDGE_COLORS[d.type] || "#4b5563";
+  };
+
+  const link = zoomG.append("g").selectAll("line").data(shownLinks).enter().append("line")
+    .attr("class","link")
+    .attr("stroke", edgeColor)
+    .attr("stroke-width", d => d.bond ? 2.5 : (d.count ? Math.min(1+Math.log(d.count), 3.5) : 1))
+    .attr("stroke-dasharray", d => d.bond ? "none" : "3,2")
+    .attr("stroke-opacity", d => d.bond ? 0.95 : 0.55);
+
+  const tip = $("tooltip");
+  link.on("mousemove", (e,d) => {
+    tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
+    const s = g.nodes[idOf(d.source)] || d.source, t = g.nodes[idOf(d.target)] || d.target;
+    const scopeLabel = {intra:"intra-chain", intra_protomer:"intra-protomer",
+      homotypic:"homotypic", heterotypic:"heterotypic",
+      inter_protomer:"inter-protomer"}[d.scope] || d.scope;
+    tip.innerHTML = `<b>${(EDGE_LABELS[d.type]||d.type)}</b> · ${scopeLabel}<br>`
+      + `${s.title||s.label} — ${t.title||t.label}<br>`
+      + `min dist ${d.dist.toFixed(2)} Å`
+      + (d.count ? ` · ${d.count} atom pairs` : "");
+  }).on("mouseout", () => tip.style.opacity = 0);
+
+  const node = zoomG.append("g").selectAll("g").data(g.nodes).enter().append("g")
+    .attr("class","node").call(drag());
+
+  node.append("circle").attr("r", d=>d.r).attr("fill", colorFn)
+    .style("cursor", "pointer");
+  node.on("click", (e,d) => { e.stopPropagation(); selectNode(d); highlightSelection(d.id); });
+  if (g.nodes.length <= 300)
+    node.append("text").attr("dx", d=>d.r+2).attr("dy", 3).text(d => d.label);
+
+  node.on("mousemove", (e,d) => {
+    tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
+    let extra = `chain ${d.chain} · degree ${d.degree}`;
+    if (d.hydro!=null) extra += `<br>hydropathy ${d.hydro}`;
+    if (d.vol!=null) extra += ` · vol ${d.vol} Å³`;
+    if (d.sasa!=null) extra += `<br>SASA ${d.sasa.toFixed(1)} Å²`
+      + (d.relsasa!=null ? ` (${(d.relsasa*100).toFixed(0)}% exp.)` : "");
+    tip.innerHTML = `<b>${d.title}</b><br>${extra}`;
+  }).on("mouseout", () => tip.style.opacity = 0);
+
+  sim = d3.forceSimulation(g.nodes)
+    .force("link", d3.forceLink(shownLinks).id(d=>d.id).distance(30).strength(0.4))
+    .force("charge", d3.forceManyBody().strength(g.nodes.length>400 ? -20 : -60))
+    .force("center", d3.forceCenter(W/2, H/2))
+    .force("collide", d3.forceCollide(d=>d.r+2))
+    .on("tick", () => {
+      link.attr("x1",d=>d.source.x).attr("y1",d=>d.source.y)
+          .attr("x2",d=>d.target.x).attr("y2",d=>d.target.y);
+      node.attr("transform", d=>`translate(${d.x},${d.y})`);
+    });
+
+  // legend
+  const EDGE_LABELS = {peptide:"peptide bond", disulfide:"disulfide",
+    covalent:"other covalent", salt_bridge:"salt bridge",
+    hydrogen_bond:"hydrogen bond", hydrophobic:"hydrophobic", vdw:"van der Waals"};
+  const lg = $("legend"); lg.style.display="block";
+  let edgeLegend;
+  if (opts.edgeColorBy === "chain") {
+    edgeLegend = `<div><span class="swatch" style="background:#4b5563"></span>intra-chain</div>`
+      + `<div><span class="swatch" style="background:#f59e0b"></span>inter (any)</div>`;
+  } else if (opts.edgeColorBy === "scope") {
+    const present = [...new Set(shownLinks.map(l=>l.scope))]
+      .sort((a,b)=>SCOPE_RANK.indexOf(a)-SCOPE_RANK.indexOf(b));
+    const SCOPE_LABELS = {intra:"intra-chain", intra_protomer:"intra-protomer",
+      homotypic:"homotypic (A↔B, same seq)", heterotypic:"heterotypic (A↔B, diff seq)",
+      inter_protomer:"inter-protomer (A↔A′)"};
+    edgeLegend = present.map(s =>
+      `<div><span class="swatch" style="background:${SCOPE_COLORS[s]}"></span>${SCOPE_LABELS[s]}</div>`).join("");
+  } else {
+    const present = [...new Set(shownLinks.map(l=>l.type))]
+      .sort((a,b)=>INTERACTION_PRIORITY.indexOf(a)-INTERACTION_PRIORITY.indexOf(b));
+    edgeLegend = present.map(t =>
+      `<div><span class="swatch" style="background:${EDGE_COLORS[t]||"#4b5563"}"></span>${EDGE_LABELS[t]||t}</div>`).join("");
+  }
+  lg.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${legendTitle}</div>`
+    + legendItems.map(([c,t])=>`<div><span class="swatch" style="background:${c}"></span>${t}</div>`).join("")
+    + `<div style="font-weight:600;margin:6px 0 4px">Edges</div>` + edgeLegend;
+}
+
+function drag() {
+  return d3.drag()
+    .on("start", (e,d) => { if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
+    .on("drag", (e,d) => { d.fx=e.x; d.fy=e.y; })
+    .on("end", (e,d) => { if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; });
+}
+
+// outline the selected node (and dim the rest) to link graph ↔ inset
+function highlightSelection(nodeId) {
+  const neigh = new Set([nodeId]);
+  graph.links.forEach(l => {
+    const s = idOf(l.source), t = idOf(l.target);
+    if (s === nodeId) neigh.add(t);
+    if (t === nodeId) neigh.add(s);
+  });
+  d3.select("#graph").selectAll(".node circle")
+    .attr("stroke", d => d.id===nodeId ? "#ffffff" : (neigh.has(d.id) ? "#ffffff" : "#0f1115"))
+    .attr("stroke-width", d => d.id===nodeId ? 3 : (neigh.has(d.id) ? 1.8 : 1.5))
+    .attr("opacity", d => neigh.has(d.id) ? 1 : 0.35);
+  d3.select("#graph").selectAll(".link")
+    .attr("stroke-opacity", l => {
+      const s = idOf(l.source), t = idOf(l.target);
+      return (s===nodeId || t===nodeId) ? 0.95 : 0.12;
+    });
+}
+function clearHighlight() {
+  d3.select("#graph").selectAll(".node circle")
+    .attr("stroke", "#0f1115").attr("stroke-width", 1.5).attr("opacity", 1);
+  d3.select("#graph").selectAll(".link")
+    .attr("stroke-opacity", d => d.bond ? 0.95 : 0.55);
+}
+
+// parse "A,B ; C,D" into Map(chain -> groupId). Returns null if empty.
+function parseProtomerGroups(str) {
+  if (!str || !str.trim()) return null;
+  const groups = new Map();
+  str.split(";").forEach((grp, gi) => {
+    grp.split(",").map(s=>s.trim()).filter(Boolean).forEach(ch => groups.set(ch, gi));
+  });
+  return groups.size ? groups : null;
+}
+
+// ---------- 3D structural inset (Three.js) ----------
+const ELEMENT_COLOR = {
+  C:0x909aaa, N:0x3b82f6, O:0xef4444, S:0xeab308, P:0xf59e0b,
+  H:0xe6e8eb, FE:0xd97706, ZN:0x94a3b8, MG:0x22c55e, CA:0x64748b
+};
+function elemColor(el){ return ELEMENT_COLOR[el] ?? 0xcbd2dd; }
+
+const inset3d = (() => {
+  let renderer, scene, camera, raf, group;
+  let dragging=false, lastX=0, lastY=0, rotX=0, rotY=0, dist=20, target=new THREE.Vector3();
+
+  function init() {
+    const el = $("insetCanvas");
+    const W = el.clientWidth, H = el.clientHeight;
+    renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setSize(W, H);
+    renderer.setClearColor(0x0b0d11, 1);
+    el.innerHTML = ""; el.appendChild(renderer.domElement);
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(45, W/H, 0.1, 1000);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const dl = new THREE.DirectionalLight(0xffffff, 0.8); dl.position.set(5,8,10); scene.add(dl);
+
+    // mouse rotate / zoom
+    el.addEventListener("mousedown", e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;});
+    window.addEventListener("mouseup", ()=>dragging=false);
+    window.addEventListener("mousemove", e=>{
+      if(!dragging) return;
+      rotY += (e.clientX-lastX)*0.01; rotX += (e.clientY-lastY)*0.01;
+      rotX = Math.max(-1.5, Math.min(1.5, rotX));
+      lastX=e.clientX; lastY=e.clientY;
+    });
+    el.addEventListener("wheel", e=>{e.preventDefault(); dist*=(1+Math.sign(e.deltaY)*0.1); dist=Math.max(4,Math.min(80,dist));}, {passive:false});
+  }
+
+  function loop() {
+    raf = requestAnimationFrame(loop);
+    if (group) {
+      camera.position.set(
+        target.x + dist*Math.sin(rotY)*Math.cos(rotX),
+        target.y + dist*Math.sin(rotX),
+        target.z + dist*Math.cos(rotY)*Math.cos(rotX)
+      );
+      camera.lookAt(target);
+    }
+    renderer.render(scene, camera);
+  }
+
+  // atoms: array of atom objs; highlightKeys: Set of residue keys to emphasize
+  function show(atoms, highlightKeys) {
+    if (!renderer) { init(); loop(); }
+    if (group) { scene.remove(group); disposeGroup(group); }
+    group = new THREE.Group();
+
+    // center
+    const cx = d3.mean(atoms,a=>a.x), cy = d3.mean(atoms,a=>a.y), cz = d3.mean(atoms,a=>a.z);
+    target.set(0,0,0);
+    const pos = atoms.map(a=>new THREE.Vector3(a.x-cx, a.y-cy, a.z-cz));
+    // auto-fit distance from bounding radius
+    let maxR = 1;
+    pos.forEach(p=> maxR = Math.max(maxR, p.length()));
+    dist = maxR*2.6 + 4;
+
+    const resKeyOf = a => `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}`;
+
+    // atoms as spheres
+    atoms.forEach((a,i)=>{
+      const hl = highlightKeys.has(resKeyOf(a));
+      const r = (a.element==="H") ? 0.25 : (hl ? 0.42 : 0.32);
+      const geo = new THREE.SphereGeometry(r, 16, 12);
+      const mat = new THREE.MeshLambertMaterial({
+        color: elemColor(a.element),
+        emissive: hl ? elemColor(a.element) : 0x000000,
+        emissiveIntensity: hl ? 0.25 : 0
+      });
+      const m = new THREE.Mesh(geo, mat);
+      m.position.copy(pos[i]);
+      if (!hl) mat.transparent = true, mat.opacity = 0.55;
+      group.add(m);
+    });
+
+    // bonds as cylinders (covalent distance ≤ ~1.95, S-S ≤ 2.4)
+    for (let i=0;i<atoms.length;i++) for (let j=i+1;j<atoms.length;j++) {
+      const d = pos[i].distanceTo(pos[j]);
+      const ss = atoms[i].element==="S" && atoms[j].element==="S";
+      if (d <= (ss?2.4:1.95) && d > 0.4) {
+        addBond(group, pos[i], pos[j],
+          highlightKeys.has(resKeyOf(atoms[i])) || highlightKeys.has(resKeyOf(atoms[j])));
+      }
+    }
+    scene.add(group);
+  }
+
+  function addBond(g, p1, p2, hl) {
+    const dir = new THREE.Vector3().subVectors(p2,p1);
+    const len = dir.length();
+    const geo = new THREE.CylinderGeometry(hl?0.1:0.07, hl?0.1:0.07, len, 8);
+    const mat = new THREE.MeshLambertMaterial({color: hl?0xcbd2dd:0x5b6472,
+      transparent:!hl, opacity: hl?1:0.5});
+    const m = new THREE.Mesh(geo, mat);
+    m.position.copy(p1).add(p2).multiplyScalar(0.5);
+    m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+    g.add(m);
+  }
+
+  function disposeGroup(g){ g.traverse(o=>{ if(o.geometry)o.geometry.dispose(); if(o.material)o.material.dispose(); }); }
+
+  function resize() {
+    if (!renderer) return;
+    const el = $("insetCanvas"), W = el.clientWidth, H = el.clientHeight;
+    renderer.setSize(W,H); camera.aspect=W/H; camera.updateProjectionMatrix();
+  }
+  function stop(){ if(raf) cancelAnimationFrame(raf); }
+
+  return { show, resize, stop };
+})();
+
+// ---------- node selection → inset ----------
+let selectedNodeId = null;
+const BACKBONE = new Set(["N","CA","C","O"]);
+
+function selectNode(node) {
+  if (!resAtomIndex) return;
+  selectedNodeId = node.id;
+
+  // residues to show in the inset:
+  //  - the selected residue (full atoms, highlighted)
+  //  - residues it directly contacts in the network (backbone only, for context)
+  //  - sequential neighbors i-1 / i+1 of every shown residue (backbone only),
+  //    so the peptide backbone is continuous even when excludeSeqAdj hid those edges
+  const byId = new Map(graph.nodes.map(n=>[n.id, n]));
+
+  const contactIds = new Set([node.id]);
+  graph.links.forEach(l => {
+    const s = idOf(l.source), t = idOf(l.target);
+    if (s === node.id) contactIds.add(t);
+    if (t === node.id) contactIds.add(s);
+  });
+
+  // collect the residue keys we want, with a flag for full vs backbone-only
+  const wanted = new Map(); // atomKey -> {full:boolean}
+  const addKey = (key, full) => {
+    if (!key) return;
+    const prev = wanted.get(key);
+    wanted.set(key, {full: (prev && prev.full) || full});
+  };
+
+  const selKey = node.atomKey;
+  addKey(selKey, true);
+  contactIds.forEach(id => { const nd = byId.get(id); if (nd) addKey(nd.atomKey, id===node.id); });
+
+  // add sequential neighbors (backbone only) for every residue currently wanted.
+  // use a (chain, resSeq) -> key lookup so this stays cheap for hub residues.
+  if (!resAtomIndex._seqLookup) {
+    const lut = new Map();
+    for (const k of resAtomIndex.keys()) {
+      const p = k.split("|");
+      lut.set(p[0] + "|" + parseInt(p[1]), k);
+    }
+    resAtomIndex._seqLookup = lut;
+  }
+  const seqLut = resAtomIndex._seqLookup;
+  const baseKeys = [...wanted.keys()];
+  baseKeys.forEach(key => {
+    const parts = key.split("|");
+    const chain = parts[0], resSeq = parseInt(parts[1]);
+    if (isNaN(resSeq)) return;
+    [resSeq-1, resSeq+1].forEach(rs => {
+      const k = seqLut.get(chain + "|" + rs);
+      if (k) addKey(k, false);
+    });
+  });
+
+  // build the atom list
+  const atoms = [];
+  const highlightKeys = new Set([selKey]);
+  for (const [key, info] of wanted) {
+    const ats = resAtomIndex.get(key) || [];
+    for (const a of ats) {
+      if (info.full || BACKBONE.has(a.name)) atoms.push(a);
+    }
+  }
+
+  if (!atoms.length) return;
+
+  $("inset").style.display = "block";
+  $("insetTitle").textContent = node.title || node.label;
+  const nNeigh = contactIds.size - 1;
+  $("insetInfo").innerHTML =
+    `<b>${node.title||node.label}</b> and ${nNeigh} contacting residue${nNeigh===1?"":"s"}`
+    + `<br><span style="color:#6b7280">context shown as backbone · drag to rotate · scroll to zoom</span>`;
+  inset3d.resize();
+  inset3d.show(atoms, highlightKeys);
+}
+
+// ---------- options reader ----------
+function readOpts() {
+  return {
+    assemblyMode: $("assemblyMode").value,
+    granularity: $("granularity").value,
+    colorBy: $("colorBy").value,
+    sizeBy: $("sizeBy").value,
+    edgeFilter: $("edgeFilter").value,
+    edgeColorBy: $("edgeColorBy").value,
+    cutoff: parseFloat($("cutoff").value),
+    atomScope: $("atomScope").value,
+    covalentOnly: $("covalentOnly").checked,
+    intraChain: $("intraChain").checked,
+    interChain: $("interChain").checked,
+    interProtomer: $("interProtomer").checked,
+    protomerGroups: parseProtomerGroups($("protomerGroups").value),
+    excludeSeqAdj: $("excludeSeqAdj").checked,
+    includeHetatm: $("includeHetatm").checked
+  };
+}
+
+function prepareAtoms(opts) {
+  let atoms = parsed.atoms;
+  if (opts.assemblyMode === "monomer") {
+    const firstChain = atoms.find(a=>!a.hetatm)?.chain;
+    atoms = atoms.filter(a => a.chain === firstChain);
+    atoms = atoms.map(a=>({...a, opId:0, baseChain:a.chain}));
+  } else if (opts.assemblyMode === "bioassembly") {
+    atoms = applyBiomt(atoms, parsed.biomt);
+  } else {
+    atoms = atoms.map(a=>({...a, opId:0, baseChain:a.chain}));
+  }
+  return atoms;
+}
+
+// ---------- events ----------
+$("fileInput").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const text = await f.text();
+  loadText(text, f.name);
+});
+
+$("fetchBtn").addEventListener("click", async () => {
+  const id = $("pdbId").value.trim().toLowerCase();
+  if (id.length !== 4) { alert("Enter a 4-character PDB ID"); return; }
+  $("fetchBtn").textContent = "…";
+  try {
+    const r = await fetch(`https://files.rcsb.org/download/${id}.pdb`);
+    if (!r.ok) throw new Error("not found");
+    loadText(await r.text(), id.toUpperCase());
+  } catch(err) {
+    alert("Could not fetch " + id + ". Check the ID or upload the file.");
+  }
+  $("fetchBtn").textContent = "Fetch";
+});
+
+function loadText(text, name) {
+  parsed = parsePDB(text);
+  $("buildBtn").disabled = false;
+  const chains = [...new Set(parsed.atoms.filter(a=>!a.hetatm).map(a=>a.chain))];
+  $("asmNote").textContent = parsed.biomt.length
+    ? `${parsed.biomt.length} BIOMT operator(s) found.`
+    : "No BIOMT records; bio-assembly = asym unit.";
+  $("stats").innerHTML = `<b>${name}</b> loaded<br>`
+    + `${parsed.atoms.length} atoms, ${chains.length} chain(s)<br>`
+    + chains.map(c=>`<span class="pill">${c}</span>`).join("");
+}
+
+$("buildBtn").addEventListener("click", () => {
+  const opts = readOpts();
+  const atoms = prepareAtoms(opts);
+  $("buildBtn").textContent = "Building…"; $("buildBtn").disabled = true;
+  setTimeout(() => {
+    graph = buildGraph(atoms, opts);
+    render(graph, opts);
+    $("exportBtn").disabled = false;
+    $("exportJsonBtn").disabled = false;
+    const byScope = {intra:0, intra_protomer:0, homotypic:0, heterotypic:0, inter_protomer:0};
+    graph.links.forEach(l => byScope[l.scope] = (byScope[l.scope]||0)+1);
+    const byType = {};
+    graph.links.forEach(l => byType[l.type] = (byType[l.type]||0)+1);
+    const labels = {peptide:"peptide",disulfide:"disulfide",covalent:"covalent",
+      salt_bridge:"salt bridge",hydrogen_bond:"H-bond",hydrophobic:"hydrophobic",vdw:"vdW"};
+    const order = ["peptide","disulfide","covalent","salt_bridge","hydrogen_bond","hydrophobic","vdw"];
+    const typeStr = order.filter(t=>byType[t])
+      .map(t=>`${labels[t]}: <b>${byType[t]}</b>`).join(" · ");
+    const scopeOrder = [["intra","intra-chain"],["intra_protomer","intra-protomer"],
+      ["homotypic","homotypic"],["heterotypic","heterotypic"],["inter_protomer","inter-protomer"]];
+    const scopeStr = scopeOrder.filter(([k])=>byScope[k])
+      .map(([k,lab])=>`${lab}: <b>${byScope[k]}</b>`).join(" · ");
+    // sequence-cluster summary: which chains are the same protein
+    let clusterStr = "";
+    if (graph.meta && graph.meta.cluster) {
+      const byClu = new Map();
+      for (const [ch, cid] of graph.meta.cluster) {
+        if (!byClu.has(cid)) byClu.set(cid, []);
+        byClu.get(cid).push(ch);
+      }
+      const multi = [...byClu.values()].filter(a=>a.length>1);
+      if (multi.length)
+        clusterStr = "<br>same-sequence groups: " +
+          multi.map(a=>a.join("≡")).join(", ");
+    }
+    $("stats").innerHTML = $("stats").innerHTML.split("<br><b>Network:</b>")[0]
+      + `<br><b>Network:</b> ${graph.nodes.length} nodes, ${graph.links.length} edges`
+      + `<br>${typeStr}`
+      + `<br>${scopeStr}`
+      + clusterStr;
+    $("buildBtn").textContent = "Build Network"; $("buildBtn").disabled = false;
+  }, 20);
+});
+
+// re-render with new visual mappings; rebuild only if SASA newly required
+function reStyle() {
+  if (!graph) return;
+  const opts = readOpts();
+  const needSASA = opts.colorBy === "sasa" || opts.sizeBy === "sasa";
+  const haveSASA = graph.nodes.some(n => n.sasa != null);
+  if (needSASA && !haveSASA) {
+    $("buildBtn").click(); // rebuild to compute SASA
+  } else {
+    render(graph, opts);
+  }
+}
+$("colorBy").addEventListener("change", reStyle);
+$("sizeBy").addEventListener("change", reStyle);
+$("edgeFilter").addEventListener("change", reStyle);
+$("edgeColorBy").addEventListener("change", reStyle);
+
+$("insetClose").addEventListener("click", () => {
+  $("inset").style.display = "none";
+  selectedNodeId = null;
+  clearHighlight();
+});
+// click empty graph background to deselect
+d3.select("#graph").on("click", () => {
+  if (selectedNodeId !== null) {
+    $("inset").style.display = "none";
+    selectedNodeId = null;
+    clearHighlight();
+  }
+});
+
+$("exportBtn").addEventListener("click", () => {
+  if (!graph) return;
+  const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond\n";
+  const rows = graph.links.map(l => {
+    const s = graph.nodes.find(n=>n.id===idOf(l.source));
+    const t = graph.nodes.find(n=>n.id===idOf(l.target));
+    return [s.id, t.id, s.title, t.title,
+      (typeof l.dist==="number") ? l.dist.toFixed(2) : l.dist,
+      l.count||1, l.type, l.scope, l.bond?1:0].join(",");
+  }).join("\n");
+  download(header+rows, "pampano_edges.csv", "text/csv");
+});
+
+$("exportJsonBtn").addEventListener("click", () => {
+  if (!graph) return;
+  const clean = {
+    nodes: graph.nodes.map(n=>({id:n.id, label:n.label, chain:n.chain,
+      base_chain:n.baseChain, operator:n.opId, title:n.title,
+      resName:n.resName, hydropathy:n.hydro, volume:n.vol, sasa:n.sasa, degree:n.degree})),
+    links: graph.links.map(l=>({source:idOf(l.source), target:idOf(l.target),
+      distance:l.dist, count:l.count||1, interaction:l.type, scope:l.scope,
+      is_bond:!!l.bond}))
+  };
+  download(JSON.stringify(clean,null,2), "pampano_network.json", "application/json");
+});
+
+function download(content, name, type) {
+  const blob = new Blob([content], {type});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+$("assemblyMode").addEventListener("change", e => {
+  $("asmNote").textContent = e.target.value === "bioassembly" && parsed && !parsed.biomt.length
+    ? "No BIOMT records; will use asym unit." : "";
+});
+</script>
+</body>
+</html>
