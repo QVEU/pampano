@@ -759,7 +759,8 @@ function buildGraph(atoms, opts) {
   links.forEach(l => { used.add(l.source); used.add(l.target); });
   const remap = new Map(); let n=0;
   const fnodes = nodes.filter(nd => used.has(nd.id)).map(nd => { remap.set(nd.id, n); return {...nd, id:n++}; });
-  const flinks = links.map(l => ({...l, source:remap.get(l.source), target:remap.get(l.target)}));
+  const flinks = links.map(l => ({...l, source:remap.get(l.source), target:remap.get(l.target),
+    type: l.type || "vdw", scope: l.scope || "heterotypic"}));
 
   // index atoms per residue node for the 3D inset
   sceneAtoms = sel;
@@ -952,8 +953,7 @@ function render(g, opts) {
     edgeLegend = present.map(s =>
       `<div><span class="swatch" style="background:${SCOPE_COLORS[s]||"#4b5563"}"></span>${SCOPE_LABELS[s]||s||"unclassified"}</div>`).join("");
   } else {
-    const present = [...new Set(shownLinks.map(l=>l.type))]
-      .filter(t => t != null)
+    const present = [...new Set(shownLinks.map(l=>l.type).filter(t => t != null))]
       .sort((a,b)=>INTERACTION_PRIORITY.indexOf(a)-INTERACTION_PRIORITY.indexOf(b));
     edgeLegend = present.map(t =>
       `<div><span class="swatch" style="background:${EDGE_COLORS[t]||"#4b5563"}"></span>${EDGE_LABELS[t]||t}</div>`).join("");
