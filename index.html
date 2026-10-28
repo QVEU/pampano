@@ -615,6 +615,16 @@ function isPeptideBond(a, b, d, caOnly) {
   return false;
 }
 
+// which part of its residue an atom belongs to: "backbone", "sidechain" or "hetatm".
+// Backbone = N, CA, C, O, OXT and the hydrogens on N/CA; everything else on a
+// polymer residue is side chain.
+const BACKBONE_ATOMS = new Set(["N","CA","C","O","OXT","H","H1","H2","H3","HN","HA","HA2","HA3"]);
+function atomPart(a) {
+  if (a.hetatm) return "hetatm";
+  return BACKBONE_ATOMS.has(a.name) ? "backbone" : "sidechain";
+}
+const PART_ABBR = {backbone:"bb", sidechain:"sc", hetatm:"het"};
+
 // classify one atom pair: {type, bond}. Bonds first (peptide > disulfide/covalent),
 // then non-covalent contacts via classifyInteraction. Always returns a defined type.
 function classifyPair(a, b, d, atoms, geom, ia, ib, caOnly) {
@@ -742,7 +752,7 @@ function buildGraph(atoms, opts) {
     if (!scopeIncluded(scope, opts)) continue;
     const {type, bond} = classifyPair(a, b, d, sel, geom, i, j, caOnly);
     if (opts.covalentOnly && !bond) continue;
-    contacts.push({i, j, d, scope, type, bond});
+    contacts.push({i, j, d, scope, type, bond, pi: atomPart(a), pj: atomPart(b)});
   }
 
   let nodes, links;
@@ -761,7 +771,8 @@ function buildGraph(atoms, opts) {
       title: `${a.chain} ${a.resName}${a.resSeq}${a.iCode||""} ${a.name}`
     }));
     links = contacts.map(c => ({source:c.i, target:c.j, dist:c.d,
-      type:c.type, scope:c.scope, inter:c.scope !== "intra", bond:c.bond}));
+      type:c.type, scope:c.scope, inter:c.scope !== "intra", bond:c.bond,
+      sourcePart:c.pi, targetPart:c.pj, partCounts:{[`${PART_ABBR[c.pi]}-${PART_ABBR[c.pj]}`]:1}}));
   } else {
     // residue-level: collapse atom pairs to residue-residue edges
     const resMap = new Map();
@@ -775,7 +786,10 @@ function buildGraph(atoms, opts) {
     const resList = [...resMap.values()];
     const resIndex = new Map(resList.map((r,i)=>[r.key,i]));
 
-    // strongest interaction and most notable scope label each aggregated edge
+    // strongest interaction and most notable scope label each aggregated edge.
+    // sourcePart/targetPart come from the atom pair that defines the edge's type
+    // (the closest pair of the winning type); partCounts tallies every atom pair
+    // by "source-target" part, e.g. {"bb-sc": 3, "sc-sc": 12}.
     const edgeAgg = new Map(); // "lo-hi" -> edge
     for (const c of contacts) {
       const ri = resIndex.get(residueKey(sel[c.i])), rj = resIndex.get(residueKey(sel[c.j]));
@@ -784,10 +798,19 @@ function buildGraph(atoms, opts) {
       const lo = Math.min(ri,rj), hi = Math.max(ri,rj), ek = lo+"-"+hi;
       let e = edgeAgg.get(ek);
       if (!e) edgeAgg.set(ek, e = {source:lo, target:hi, dist:Infinity, count:0,
-        type:null, scope:null, inter:false, bond:false});
+        type:null, scope:null, inter:false, bond:false,
+        sourcePart:null, targetPart:null, typeDist:Infinity, partCounts:{}});
+      // orient the atom pair's parts to the edge's source (lo) / target (hi)
+      const [ps, pt] = ri === lo ? [c.pi, c.pj] : [c.pj, c.pi];
+      const pk = `${PART_ABBR[ps]}-${PART_ABBR[pt]}`;
+      e.partCounts[pk] = (e.partCounts[pk] || 0) + 1;
       e.count++;
       e.dist = Math.min(e.dist, c.d);
-      e.type = strongerInteraction(e.type, c.type);
+      const won = strongerInteraction(e.type, c.type);
+      if (e.type === null || (won === c.type && won !== e.type) || (c.type === e.type && c.d < e.typeDist)) {
+        e.sourcePart = ps; e.targetPart = pt; e.typeDist = c.d;
+      }
+      e.type = won;
       e.scope = mergeScoperank(e.scope, c.scope);
       e.inter = e.scope !== "intra";
       e.bond = e.bond || c.bond;
@@ -815,7 +838,7 @@ function buildGraph(atoms, opts) {
         title:`${r.chain} ${r.resName} ${r.resSeq}${r.iCode||""}`
       });
     });
-    links = edges.map(e => ({...e, source:remap.get(e.source), target:remap.get(e.target)}));
+    links = edges.map(({typeDist, ...e}) => ({...e, source:remap.get(e.source), target:remap.get(e.target)}));
   }
 
   // index the selected atoms per residue for the 3D inset
@@ -859,6 +882,11 @@ function filterLinks(links, ef) {
   if (ef === "contacts") return links.filter(l => !l.bond);
   if (ef.startsWith("scope_")) { const sc = ef.slice(6); return links.filter(l => l.scope === sc); }
   return links.filter(l => l.type === ef);
+}
+
+// {"bb-sc":3,"sc-sc":12} -> "bb-sc:3;sc-sc:12" (largest first)
+function formatPartCounts(pc) {
+  return Object.entries(pc || {}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}:${v}`).join(";");
 }
 
 function render(g, opts) {
@@ -962,7 +990,9 @@ function render(g, opts) {
     tip.innerHTML = `<b>${EDGE_LABELS[d.type] || d.type || "unclassified"}</b> · ${scopeLabel}<br>`
       + `${s.title||s.label} — ${t.title||t.label}<br>`
       + `min dist ${d.dist.toFixed(2)} Å`
-      + (d.count ? ` · ${d.count} atom pair${d.count === 1 ? "" : "s"}` : "");
+      + (d.count ? ` · ${d.count} atom pair${d.count === 1 ? "" : "s"}` : "")
+      + (d.sourcePart ? `<br>${d.sourcePart} ↔ ${d.targetPart}` : "")
+      + (d.count > 1 ? ` <span style="color:#6b7280">(${formatPartCounts(d.partCounts)})</span>` : "");
   }).on("mouseout", () => tip.style.opacity = 0);
 
   const node = zoomG.append("g").selectAll("g").data(g.nodes).enter().append("g")
@@ -1419,13 +1449,14 @@ d3.select("#graph").on("click", () => {
 
 $("exportBtn").addEventListener("click", () => {
   if (!graph) return;
-  const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond\n";
+  const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond,source_part,target_part,part_counts\n";
   const rows = graph.links.map(l => {
     const s = graph.nodes.find(n=>n.id===idOf(l.source));
     const t = graph.nodes.find(n=>n.id===idOf(l.target));
     return [s.id, t.id, s.title, t.title,
       (typeof l.dist==="number") ? l.dist.toFixed(2) : l.dist,
-      l.count||1, l.type, l.scope, l.bond?1:0].join(",");
+      l.count||1, l.type, l.scope, l.bond?1:0,
+      l.sourcePart, l.targetPart, formatPartCounts(l.partCounts)].join(",");
   }).join("\n");
   download(header+rows, "pampano_edges.csv", "text/csv");
 });
@@ -1438,7 +1469,8 @@ $("exportJsonBtn").addEventListener("click", () => {
       resName:n.resName, hydropathy:n.hydro, volume:n.vol, sasa:n.sasa, degree:n.degree})),
     links: graph.links.map(l=>({source:idOf(l.source), target:idOf(l.target),
       distance:l.dist, count:l.count||1, interaction:l.type, scope:l.scope,
-      is_bond:!!l.bond}))
+      is_bond:!!l.bond, source_part:l.sourcePart, target_part:l.targetPart,
+      part_counts:l.partCounts}))
   };
   download(JSON.stringify(clean,null,2), "pampano_network.json", "application/json");
 });
@@ -1499,8 +1531,8 @@ Click any node to open a structural view of that residue and the residues it con
 Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, ions, water) are drawn as **squares** with a light outline, so non-polymer components stand out. HETATM nodes appear only when **Include HETATM** is on, and carry no hydropathy/volume/SASA values (they fall back to a neutral color under those coloring modes).
 
 ## Exports
-- **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, and covalent-bond flag per edge.
-- **JSON graph** — nodes (residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (distance, count, interaction, scope, bond flag).
+- **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, covalent-bond flag, and backbone/sidechain/HETATM part of each partner (plus per-part atom-pair counts) per edge.
+- **JSON graph** — nodes (residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (distance, count, interaction, scope, bond flag, source/target part, part counts).
 
 ## Glossary
 
@@ -1528,6 +1560,11 @@ From strongest/most-specific to weakest; when several atom-pair interactions con
 Distance alone isn't enough; the angle is checked too.
 - **With explicit hydrogens** (all-atom scope, if present): true donor–H···acceptor angle ≥ 120° (near-linear).
 - **Without hydrogens** (usual for crystal structures): heavy-atom surrogate — the angle at the acceptor between the donor and the acceptor's bonded antecedent (D···A–AA) ≥ 90°, so the donor approaches from the lone-pair side.
+
+### Interaction partners (backbone / side chain / HETATM)
+Each edge records which part of each partner is involved: **backbone** (N, CA, C, O, OXT and their hydrogens), **sidechain** (any other atom of a polymer residue), or **hetatm** (ligand, ion, water).
+- At atom level this is just the part of each of the two atoms.
+- At residue level an edge combines many atom pairs. The two partner columns give the parts of the atom pair that defines the edge's interaction type (the closest pair of the strongest type), so a hydrogen-bond edge labelled backbone ↔ sidechain means that H-bond is from the first residue's backbone to the second's side chain. A part-counts column tallies all contributing atom pairs, e.g. @sc-sc:12;bb-sc:3@ (bb = backbone, sc = side chain, het = HETATM; the first part belongs to the source node).
 
 ### Node properties
 - **Hydrophobicity** — Kyte–Doolittle hydropathy; higher = more hydrophobic.

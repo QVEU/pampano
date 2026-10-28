@@ -55,8 +55,8 @@ Click any node to open a structural view (bottom-left) of that residue and the r
 
 ## Exports
 
-- **CSV edge list** — one row per edge: node indices and labels, minimum distance, atom-pair count, interaction type, scope, and whether it is a covalent bond.
-- **JSON graph** — nodes (with per-node properties: residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (with distance, count, interaction, scope, bond flag).
+- **CSV edge list** — one row per edge: node indices and labels, minimum distance, atom-pair count, interaction type, scope, whether it is a covalent bond, `source_part` / `target_part` (backbone, sidechain or hetatm for each partner) and `part_counts`.
+- **JSON graph** — nodes (with per-node properties: residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (with distance, count, interaction, scope, bond flag, source/target part, part counts).
 
 ---
 
@@ -91,6 +91,11 @@ Pampano doesn't accept an H-bond on distance alone; it also checks the angle.
 
 - **With explicit hydrogens** (all-atom scope on a structure that has them): the true donor–H···acceptor angle must be ≥ 120° (near-linear).
 - **Without hydrogens** (the usual case for crystal structures): it uses the heavy-atom surrogate — the angle at the acceptor between the donor and the acceptor's covalently bonded antecedent (D···A–AA) must be ≥ 90°, so the donor approaches from the lone-pair side rather than through a bonded atom.
+
+### Interaction partners (backbone / side chain / HETATM)
+Each edge records which part of each partner is involved: **backbone** (N, CA, C, O, OXT and their hydrogens), **sidechain** (any other atom of a polymer residue), or **hetatm** (ligand, ion, water).
+- At atom level this is simply the part of each of the two atoms.
+- At residue level an edge combines many atom pairs. `source_part` / `target_part` give the parts of the atom pair that defines the edge's interaction type (the closest pair of the strongest type) — so a hydrogen-bond edge with `backbone` / `sidechain` means that H-bond runs from the source residue's backbone to the target residue's side chain. `part_counts` tallies every contributing atom pair, e.g. `sc-sc:12;bb-sc:3` (bb = backbone, sc = side chain, het = HETATM; the first part belongs to the source node).
 
 ### Node properties
 
