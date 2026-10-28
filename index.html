@@ -135,17 +135,39 @@
     <summary>Advanced</summary>
     <label><input type="checkbox" id="covalentOnly"> Covalent bonds only (~1.9 Å)</label>
     <label><input type="checkbox" id="intraChain" checked> Include intra-chain contacts</label>
-    <label><input type="checkbox" id="interChain" checked> Include inter-chain contacts</label>
+    <label><input type="checkbox" id="interChain" checked> Include inter-chain contacts (A↔B)</label>
+    <label><input type="checkbox" id="interProtomer" checked> Include inter-protomer contacts (A↔A′, bio-assembly)</label>
+    <label>Protomer groups (optional)</label>
+    <input type="text" id="protomerGroups" placeholder="e.g. A,B ; C,D">
+    <div class="note">Group chains into protomers to distinguish within-protomer from between-protomer interfaces. Chains in the same group → "intra-protomer". Leave blank to classify inter-chain contacts automatically by exact sequence (homotypic = same sequence, heterotypic = different).</div>
     <label><input type="checkbox" id="excludeSeqAdj" checked> Exclude sequential neighbors (residue mode)</label>
     <label><input type="checkbox" id="includeHetatm"> Include HETATM (ligands/water)</label>
   </details>
 
   <label>Show edges</label>
   <select id="edgeFilter">
-    <option value="all">Bonds + contacts</option>
-    <option value="contacts">Contacts only (non-covalent)</option>
+    <option value="all">All (bonds + contacts)</option>
     <option value="bonds">Bonds only (covalent)</option>
+    <option value="contacts">Contacts only (non-covalent)</option>
+    <option value="peptide">Peptide bonds</option>
+    <option value="disulfide">Disulfide bonds</option>
+    <option value="salt_bridge">Salt bridges</option>
+    <option value="hydrogen_bond">Hydrogen bonds</option>
+    <option value="hydrophobic">Hydrophobic</option>
+    <option value="scope_intra">Scope: intra-chain</option>
+    <option value="scope_intra_protomer">Scope: intra-protomer (grouped)</option>
+    <option value="scope_homotypic">Scope: homotypic (A↔B, same seq)</option>
+    <option value="scope_heterotypic">Scope: heterotypic (A↔B, diff seq)</option>
+    <option value="scope_inter_protomer">Scope: inter-protomer (A↔A′)</option>
   </select>
+
+  <label>Color edges by</label>
+  <select id="edgeColorBy">
+    <option value="type">Interaction type</option>
+    <option value="scope">Contact scope (intra / inter-chain / inter-protomer)</option>
+    <option value="chain">Intra / inter (combined)</option>
+  </select>
+  <div class="note">H-bonds use donor–acceptor angle geometry. If the structure has explicit hydrogens, choose "All atoms" scope for the stricter D–H···A angle; otherwise a heavy-atom angle criterion is used.</div>
 
   <button id="buildBtn" disabled>Build Network</button>
   <button class="secondary" id="exportBtn" disabled>Export edges (CSV)</button>
@@ -285,13 +307,13 @@ function parsePDB(text) {
 }
 
 function applyBiomt(atoms, biomt) {
-  if (!biomt.length) return atoms.map(a => ({...a, opId: 0}));
+  if (!biomt.length) return atoms.map(a => ({...a, opId: 0, baseChain: a.chain}));
   const out = [];
   biomt.forEach((op, oi) => {
     const [r0, r1, r2] = op.matrix, t = op.trans;
     for (const a of atoms) {
       out.push({
-        ...a, opId: oi,
+        ...a, opId: oi, baseChain: a.chain,
         x: r0[0]*a.x + r0[1]*a.y + r0[2]*a.z + t[0],
         y: r1[0]*a.x + r1[1]*a.y + r1[2]*a.z + t[1],
         z: r2[0]*a.x + r2[1]*a.y + r2[2]*a.z + t[2],
@@ -340,11 +362,211 @@ function buildContacts(atoms, cutoff) {
   return pairs;
 }
 
-// ---------- bond classification ----------
-// decide if an atom pair is covalently bonded, from element-aware distance
+// when a residue edge aggregates atom pairs of differing scope, keep the most
+// "notable" one (interface contacts rank above internal ones)
+const SCOPE_RANK = ["heterotypic","homotypic","inter_protomer","intra_protomer","intra"];
+function mergeScoperank(a, b) {
+  if (!a) return b; if (!b) return a;
+  return SCOPE_RANK.indexOf(a) <= SCOPE_RANK.indexOf(b) ? a : b;
+}
+
+// ---------- chain sequence fingerprinting ----------
+// Build a per-chain sequence string (by baseChain) so we can tell whether two
+// different chains are the same protein (homotypic) or different (heterotypic).
+const THREE_TO_ONE = {ALA:"A",ARG:"R",ASN:"N",ASP:"D",CYS:"C",GLN:"Q",GLU:"E",
+  GLY:"G",HIS:"H",ILE:"I",LEU:"L",LYS:"K",MET:"M",PHE:"F",PRO:"P",SER:"S",
+  THR:"T",TRP:"W",TYR:"Y",VAL:"V",MSE:"M",SEC:"U",PYL:"O"};
+
+function chainSequences(atoms) {
+  // collect ordered residues per baseChain (use CA presence to mark a residue)
+  const byChain = new Map();
+  for (const a of atoms) {
+    if (a.hetatm) continue;
+    const bc = a.baseChain;
+    if (!byChain.has(bc)) byChain.set(bc, new Map());
+    const resKey = a.resSeq + "|" + a.iCode;
+    if (!byChain.get(bc).has(resKey))
+      byChain.get(bc).set(resKey, {resSeq:a.resSeq, iCode:a.iCode, resName:a.resName});
+  }
+  const seqs = new Map();
+  for (const [bc, resMap] of byChain) {
+    const res = [...resMap.values()].sort((x,y)=>
+      x.resSeq - y.resSeq || x.iCode.localeCompare(y.iCode));
+    seqs.set(bc, res.map(r => THREE_TO_ONE[r.resName] || "X").join(""));
+  }
+  return seqs;
+}
+
+// group baseChains by exact sequence identity.
+// Two chains of the same protein in one structure share an identical sequence string;
+// different chains differ. Exact comparison can't misclassify, so no fuzzy matching.
+// returns Map(baseChain -> clusterId)
+function clusterChainsBySequence(seqs) {
+  const seqToId = new Map();
+  const cluster = new Map();
+  let next = 0;
+  for (const [chain, seq] of seqs) {
+    if (!seqToId.has(seq)) seqToId.set(seq, next++);
+    cluster.set(chain, seqToId.get(seq));
+  }
+  return cluster;
+}
+
+// classify the structural scope of a contact between two atoms:
+//  intra        — same chain copy (same baseChain + same opId)
+//  inter_chain  — different base chains (e.g. A↔B), same or any operator
+//  inter_protomer — same base chain, different symmetry operator (A↔A_1)
+function contactScope(a, b) {
+  const sameBase = a.baseChain === b.baseChain;
+  const sameOp = (a.opId ?? 0) === (b.opId ?? 0);
+  if (sameBase && sameOp) return "intra";
+  if (!sameBase) return "inter_chain";
+  return "inter_protomer"; // same base chain, different operator
+}
+
+// ---------- bond / interaction classification ----------
 function isCovalent(elA, elB, d) {
   if (elA === "S" && elB === "S") return d <= 2.4;   // disulfide ~2.05 Å
   return d <= 1.95;                                   // generic covalent ceiling
+}
+
+// vector helpers
+function vsub(a,b){ return [a.x-b.x, a.y-b.y, a.z-b.z]; }
+function vdot(u,v){ return u[0]*v[0]+u[1]*v[1]+u[2]*v[2]; }
+function vlen(u){ return Math.sqrt(vdot(u,u)); }
+// angle (degrees) at vertex V between points P and Q
+function angleAt(V, P, Q) {
+  const u = vsub(P,V), w = vsub(Q,V);
+  const denom = vlen(u)*vlen(w);
+  if (denom === 0) return 0;
+  let c = vdot(u,w)/denom;
+  c = Math.max(-1, Math.min(1, c));
+  return Math.acos(c) * 180/Math.PI;
+}
+
+// Build covalent-antecedent map: for each atom index, the atoms bonded to it.
+// Used to find the acceptor's antecedent (AA) and donor's antecedent for H-bond geometry.
+// Also records bonded hydrogens separately so we can use true D–H···A angle when H is present.
+function buildAntecedents(atoms) {
+  const cell = 2.0, grid = new Map();
+  const key=(i,j,k)=>i+","+j+","+k;
+  atoms.forEach((a,idx)=>{
+    const k=key(Math.floor(a.x/cell),Math.floor(a.y/cell),Math.floor(a.z/cell));
+    if(!grid.has(k)) grid.set(k,[]); grid.get(k).push(idx);
+  });
+  const ante = atoms.map(()=>[]);      // bonded heavy atoms
+  const hydro = atoms.map(()=>[]);     // bonded hydrogens
+  atoms.forEach((a,idx)=>{
+    const ci=Math.floor(a.x/cell),cj=Math.floor(a.y/cell),ck=Math.floor(a.z/cell);
+    for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++)for(let dk=-1;dk<=1;dk++){
+      const b=grid.get(key(ci+di,cj+dj,ck+dk)); if(!b) continue;
+      for(const n of b){
+        if(n===idx) continue;
+        const o=atoms[n];
+        const dx=a.x-o.x,dy=a.y-o.y,dz=a.z-o.z, d2=dx*dx+dy*dy+dz*dz;
+        const isH = (o.element==="H"||o.element==="D");
+        if (a.element==="H"||a.element==="D") continue; // index atom is H; skip (handled from heavy side)
+        if (isH) { if (d2 <= 1.3*1.3) hydro[idx].push(n); }   // X–H ~1.0 Å
+        else     { if (d2 <= 1.95*1.95) ante[idx].push(n); }
+      }
+    }
+  });
+  return {ante, hydro};
+}
+
+// charged atom groups for salt bridges
+const POS_ATOMS = { // basic side-chain N
+  ARG: ["NH1","NH2","NE"], LYS: ["NZ"], HIS: ["ND1","NE2"]
+};
+const NEG_ATOMS = { // acidic side-chain O
+  ASP: ["OD1","OD2"], GLU: ["OE1","OE2"]
+};
+// H-bond donor/acceptor heavy atoms (simplified)
+const HBOND_DONORS = new Set(["N","O"]);     // by element; backbone N, side-chain N/O
+const HBOND_ACCEPTORS = new Set(["O","N"]);  // backbone O, side-chain O/N
+function isCharged(resName, atomName, sign) {
+  const t = sign === "+" ? POS_ATOMS : NEG_ATOMS;
+  return t[resName] && t[resName].includes(atomName);
+}
+// hydrophobic carbons: side-chain C not adjacent to polar groups (approx: any C in hydrophobic residue, or any side-chain C)
+const HYDROPHOBIC_RES = new Set(["ALA","VAL","LEU","ILE","MET","PHE","TRP","PRO","CYS"]);
+
+// is this atom pair the backbone peptide bond? (C of one residue — N of the next)
+// In CA-only selections, fall back to CA(i)–CA(i+1) adjacency (~3.8 Å).
+function isPeptideBond(a, b) {
+  if (a.chain !== b.chain) return false;
+  if (a.resSeq === b.resSeq) return false;
+  // true backbone C–N linkage
+  if ((a.name==="C" && b.name==="N") || (a.name==="N" && b.name==="C")) return true;
+  // CA-only fallback: consecutive residues within virtual-bond distance
+  if (a.name==="CA" && b.name==="CA" && Math.abs(a.resSeq - b.resSeq) === 1) return true;
+  return false;
+}
+
+// classify a single atom pair interaction; returns a type string
+// geom = {ante, hydro} bonded-atom maps; ia,ib = atom indices into `atoms`
+function classifyInteraction(a, b, d, atoms, geom, ia, ib) {
+  // salt bridge: oppositely charged groups within 4.0 Å
+  if (d <= 4.0) {
+    if ((isCharged(a.resName,a.name,"+") && isCharged(b.resName,b.name,"-")) ||
+        (isCharged(a.resName,a.name,"-") && isCharged(b.resName,b.name,"+")))
+      return "salt_bridge";
+  }
+  // hydrogen bond: N/O ... N/O within 3.5 Å, with angle geometry check
+  if (d <= 3.5) {
+    const aPolar = (a.element === "N" || a.element === "O");
+    const bPolar = (b.element === "N" || b.element === "O");
+    if (aPolar && bPolar && hbondGeometryOK(atoms, geom, ia, ib))
+      return "hydrogen_bond";
+  }
+  // hydrophobic: carbon-carbon in hydrophobic context within 4.0 Å
+  if (d <= 4.0 && a.element === "C" && b.element === "C" &&
+      (HYDROPHOBIC_RES.has(a.resName) || HYDROPHOBIC_RES.has(b.resName)))
+    return "hydrophobic";
+  return "vdw";
+}
+
+// H-bond geometry check.
+// If explicit H present on a donor: require D–H···A angle >= 120° (near-linear).
+// Otherwise (no H): require acceptor-side D···A–AA angle >= 90°.
+const HBOND_DHA_MIN = 120;   // donor–H–acceptor, explicit H
+const HBOND_DAAA_MIN = 90;   // donor···acceptor–antecedent, heavy-atom only
+function hbondGeometryOK(atoms, geom, ia, ib) {
+  const {ante, hydro} = geom;
+  // explicit-H path: does either atom have an H pointing at the other?
+  const dhaOK = (donIdx, accIdx) => {
+    const hs = hydro[donIdx];
+    if (!hs || hs.length === 0) return null; // no H on this donor → can't use this path
+    const acc = atoms[accIdx];
+    return hs.some(h => angleAt(atoms[h], atoms[donIdx], acc) >= HBOND_DHA_MIN);
+  };
+  const r1 = dhaOK(ia, ib), r2 = dhaOK(ib, ia);
+  if (r1 !== null || r2 !== null) return (r1 === true) || (r2 === true);
+
+  // heavy-atom fallback: donor approaches acceptor from lone-pair side
+  const okAsAcceptor = (accIdx, donIdx) => {
+    const antes = ante[accIdx];
+    if (!antes || antes.length === 0) return true; // can't test; don't reject
+    const acc = atoms[accIdx], don = atoms[donIdx];
+    return antes.some(aaIdx => angleAt(acc, don, atoms[aaIdx]) >= HBOND_DAAA_MIN);
+  };
+  return okAsAcceptor(ib, ia) || okAsAcceptor(ia, ib);
+}
+
+// priority when collapsing many atom-pair interactions into one residue edge
+const INTERACTION_PRIORITY = ["disulfide","peptide","covalent","salt_bridge","hydrogen_bond","hydrophobic","vdw"];
+function strongerInteraction(a, b) {
+  if (!a) return b; if (!b) return a;
+  return INTERACTION_PRIORITY.indexOf(a) <= INTERACTION_PRIORITY.indexOf(b) ? a : b;
+}
+
+// does this scope pass the include/exclude option checkboxes?
+function scopeIncluded(scope, opts) {
+  if (scope === "intra") return opts.intraChain;
+  if (scope === "intra_protomer") return opts.interChain; // within a manual protomer = chain-chain
+  if (scope === "homotypic" || scope === "heterotypic") return opts.interChain;
+  if (scope === "inter_protomer") return opts.interProtomer;
+  return true;
 }
 
 // ---------- build graph ----------
@@ -352,6 +574,16 @@ function buildGraph(atoms, opts) {
   const effCutoff = opts.covalentOnly ? 1.9 : opts.cutoff;
   const sel = selectAtoms(atoms, opts);
   const pairs = buildContacts(sel, effCutoff);
+
+  // bonded-atom maps for H-bond angle geometry
+  // (skip if covalent-only or CA mode — no meaningful geometry there)
+  const needGeom = !opts.covalentOnly && opts.atomScope !== "ca";
+  const geom = needGeom ? buildAntecedents(sel) : {ante: sel.map(()=>[]), hydro: sel.map(()=>[])};
+
+  // scope context: sequence clusters + optional manual protomer groups
+  const seqs = chainSequences(atoms);
+  const cluster = clusterChainsBySequence(seqs);
+  const ctx = { cluster, groups: opts.protomerGroups || null };
 
   // SASA needed? compute per-atom on heavy atoms, then map back onto sel
   let atomSASA = null;
@@ -366,7 +598,7 @@ function buildGraph(atoms, opts) {
   if (opts.granularity === "atom") {
     const nodes = sel.map((a,i) => ({
       id: i, label: a.name,
-      group: a.chain, chain: a.chain,
+      group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId,
       resName: a.resName,
       hydro: KD[a.resName] ?? null,
       vol: VOL[a.resName] ?? null,
@@ -376,14 +608,22 @@ function buildGraph(atoms, opts) {
       title: `${a.chain} ${a.resName}${a.resSeq} ${a.name}`
     }));
     const links = pairs.filter(([i,j]) => {
-      const sameChain = sel[i].chain === sel[j].chain;
-      if (sameChain && !opts.intraChain) return false;
-      if (!sameChain && !opts.interChain) return false;
-      return true;
-    }).map(([i,j,d]) => ({source:i, target:j, dist:d,
-      inter: sel[i].chain !== sel[j].chain,
-      bond: isCovalent(sel[i].element, sel[j].element, d)}));
-    return {nodes, links};
+      const scope = contactScope(sel[i], sel[j], ctx);
+      return scopeIncluded(scope, opts);
+    }).map(([i,j,d]) => {
+      const a = sel[i], b = sel[j];
+      const scope = contactScope(a, b, ctx);
+      const peptide = isPeptideBond(a, b);
+      const covalent = isCovalent(a.element, b.element, d) || peptide;
+      let type;
+      if (peptide) type = "peptide";
+      else if (isCovalent(a.element, b.element, d))
+        type = (a.element==="S" && b.element==="S") ? "disulfide" : "covalent";
+      else type = classifyInteraction(a, b, d, sel, geom, i, j);
+      return {source:i, target:j, dist:d, scope,
+        inter: scope !== "intra", bond: covalent, type};
+    });
+    return {nodes, links, meta:{seqs, cluster}};
   }
 
   // residue-level: collapse pairs to residue-residue
@@ -391,8 +631,8 @@ function buildGraph(atoms, opts) {
   const resMap = new Map();
   sel.forEach(a => {
     const k = resKey(a);
-    if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, resSeq:a.resSeq,
-      resName:a.resName, iCode:a.iCode, sasa:0});
+    if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, baseChain:a.baseChain,
+      opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, sasa:0});
     if (atomSASA && atomSASA.has(a)) resMap.get(k).sasa += atomSASA.get(a);
   });
   const resList = [...resMap.values()];
@@ -416,6 +656,7 @@ function buildGraph(atoms, opts) {
 
   const nodes = resList.map((r,i)=>({
     id:i, label:`${r.resName}${r.resSeq}`, group:r.chain, chain:r.chain,
+    baseChain:r.baseChain, opId:r.opId,
     resName:r.resName,
     hydro: KD[r.resName] ?? null,
     vol: VOL[r.resName] ?? null,
@@ -431,7 +672,7 @@ function buildGraph(atoms, opts) {
   const remap = new Map(); let n=0;
   const fnodes = nodes.filter(nd => used.has(nd.id)).map(nd => { remap.set(nd.id, n); return {...nd, id:n++}; });
   const flinks = links.map(l => ({...l, source:remap.get(l.source), target:remap.get(l.target)}));
-  return {nodes:fnodes, links:flinks};
+  return {nodes:fnodes, links:flinks, meta:{seqs, cluster}};
 }
 
 // ---------- rendering ----------
@@ -443,9 +684,17 @@ function render(g, opts) {
   const W = svg.node().clientWidth, H = svg.node().clientHeight;
 
   // edge type filter
+  const BOND_TYPES = new Set(["peptide","disulfide","covalent"]);
   let shownLinks = g.links;
-  if (opts.edgeFilter === "contacts") shownLinks = g.links.filter(l => !l.bond);
-  else if (opts.edgeFilter === "bonds") shownLinks = g.links.filter(l => l.bond);
+  const ef = opts.edgeFilter;
+  if (ef === "bonds") shownLinks = g.links.filter(l => l.bond);
+  else if (ef === "contacts") shownLinks = g.links.filter(l => !l.bond);
+  else if (ef === "scope_intra") shownLinks = g.links.filter(l => l.scope === "intra");
+  else if (ef === "scope_intra_protomer") shownLinks = g.links.filter(l => l.scope === "intra_protomer");
+  else if (ef === "scope_homotypic") shownLinks = g.links.filter(l => l.scope === "homotypic");
+  else if (ef === "scope_heterotypic") shownLinks = g.links.filter(l => l.scope === "heterotypic");
+  else if (ef === "scope_inter_protomer") shownLinks = g.links.filter(l => l.scope === "inter_protomer");
+  else if (ef !== "all") shownLinks = g.links.filter(l => l.type === ef);
 
   // compute degree (from shown links)
   const deg = new Array(g.nodes.length).fill(0);
@@ -510,12 +759,39 @@ function render(g, opts) {
   const zoomG = svg.append("g");
   svg.call(d3.zoom().scaleExtent([0.1, 8]).on("zoom", e => zoomG.attr("transform", e.transform)));
 
+  // interaction-type colors
+  const EDGE_COLORS = {
+    peptide:"#22d3ee", disulfide:"#eab308", covalent:"#67e8f9",
+    salt_bridge:"#ef4444", hydrogen_bond:"#3b82f6",
+    hydrophobic:"#f59e0b", vdw:"#4b5563"
+  };
+  const SCOPE_COLORS = { intra:"#4b5563", intra_protomer:"#14b8a6",
+    homotypic:"#f59e0b", heterotypic:"#ec4899", inter_protomer:"#a855f7" };
+  const edgeColor = d => {
+    if (opts.edgeColorBy === "chain") return d.inter ? "#f59e0b" : "#4b5563";
+    if (opts.edgeColorBy === "scope") return SCOPE_COLORS[d.scope] || "#4b5563";
+    return EDGE_COLORS[d.type] || "#4b5563";
+  };
+
   const link = zoomG.append("g").selectAll("line").data(shownLinks).enter().append("line")
     .attr("class","link")
-    .attr("stroke", d => d.bond ? "#22d3ee" : (d.inter ? "#f59e0b" : "#4b5563"))
-    .attr("stroke-width", d => d.bond ? 2.5 : (d.count ? Math.min(1+Math.log(d.count), 4) : 1))
+    .attr("stroke", edgeColor)
+    .attr("stroke-width", d => d.bond ? 2.5 : (d.count ? Math.min(1+Math.log(d.count), 3.5) : 1))
     .attr("stroke-dasharray", d => d.bond ? "none" : "3,2")
-    .attr("stroke-opacity", d => d.bond ? 0.95 : 0.5);
+    .attr("stroke-opacity", d => d.bond ? 0.95 : 0.55);
+
+  const tip = $("tooltip");
+  link.on("mousemove", (e,d) => {
+    tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
+    const s = g.nodes[idOf(d.source)] || d.source, t = g.nodes[idOf(d.target)] || d.target;
+    const scopeLabel = {intra:"intra-chain", intra_protomer:"intra-protomer",
+      homotypic:"homotypic", heterotypic:"heterotypic",
+      inter_protomer:"inter-protomer"}[d.scope] || d.scope;
+    tip.innerHTML = `<b>${(EDGE_LABELS[d.type]||d.type)}</b> · ${scopeLabel}<br>`
+      + `${s.title||s.label} — ${t.title||t.label}<br>`
+      + `min dist ${d.dist.toFixed(2)} Å`
+      + (d.count ? ` · ${d.count} atom pairs` : "");
+  }).on("mouseout", () => tip.style.opacity = 0);
 
   const node = zoomG.append("g").selectAll("g").data(g.nodes).enter().append("g")
     .attr("class","node").call(drag());
@@ -524,7 +800,6 @@ function render(g, opts) {
   if (g.nodes.length <= 300)
     node.append("text").attr("dx", d=>d.r+2).attr("dy", 3).text(d => d.label);
 
-  const tip = $("tooltip");
   node.on("mousemove", (e,d) => {
     tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
     let extra = `chain ${d.chain} · degree ${d.degree}`;
@@ -547,13 +822,31 @@ function render(g, opts) {
     });
 
   // legend
+  const EDGE_LABELS = {peptide:"peptide bond", disulfide:"disulfide",
+    covalent:"other covalent", salt_bridge:"salt bridge",
+    hydrogen_bond:"hydrogen bond", hydrophobic:"hydrophobic", vdw:"van der Waals"};
   const lg = $("legend"); lg.style.display="block";
+  let edgeLegend;
+  if (opts.edgeColorBy === "chain") {
+    edgeLegend = `<div><span class="swatch" style="background:#4b5563"></span>intra-chain</div>`
+      + `<div><span class="swatch" style="background:#f59e0b"></span>inter (any)</div>`;
+  } else if (opts.edgeColorBy === "scope") {
+    const present = [...new Set(shownLinks.map(l=>l.scope))]
+      .sort((a,b)=>SCOPE_RANK.indexOf(a)-SCOPE_RANK.indexOf(b));
+    const SCOPE_LABELS = {intra:"intra-chain", intra_protomer:"intra-protomer",
+      homotypic:"homotypic (A↔B, same seq)", heterotypic:"heterotypic (A↔B, diff seq)",
+      inter_protomer:"inter-protomer (A↔A′)"};
+    edgeLegend = present.map(s =>
+      `<div><span class="swatch" style="background:${SCOPE_COLORS[s]}"></span>${SCOPE_LABELS[s]}</div>`).join("");
+  } else {
+    const present = [...new Set(shownLinks.map(l=>l.type))]
+      .sort((a,b)=>INTERACTION_PRIORITY.indexOf(a)-INTERACTION_PRIORITY.indexOf(b));
+    edgeLegend = present.map(t =>
+      `<div><span class="swatch" style="background:${EDGE_COLORS[t]||"#4b5563"}"></span>${EDGE_LABELS[t]||t}</div>`).join("");
+  }
   lg.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${legendTitle}</div>`
     + legendItems.map(([c,t])=>`<div><span class="swatch" style="background:${c}"></span>${t}</div>`).join("")
-    + `<div style="font-weight:600;margin:6px 0 4px">Edges</div>`
-    + `<div><span class="swatch" style="background:#22d3ee"></span>covalent bond</div>`
-    + `<div><span class="swatch" style="background:#4b5563"></span>contact (dashed)</div>`
-    + `<div><span class="swatch" style="background:#f59e0b"></span>inter-chain contact</div>`;
+    + `<div style="font-weight:600;margin:6px 0 4px">Edges</div>` + edgeLegend;
 }
 
 function drag() {
@@ -561,6 +854,16 @@ function drag() {
     .on("start", (e,d) => { if(!e.active) sim.alphaTarget(0.3).restart(); d.fx=d.x; d.fy=d.y; })
     .on("drag", (e,d) => { d.fx=e.x; d.fy=e.y; })
     .on("end", (e,d) => { if(!e.active) sim.alphaTarget(0); d.fx=null; d.fy=null; });
+}
+
+// parse "A,B ; C,D" into Map(chain -> groupId). Returns null if empty.
+function parseProtomerGroups(str) {
+  if (!str || !str.trim()) return null;
+  const groups = new Map();
+  str.split(";").forEach((grp, gi) => {
+    grp.split(",").map(s=>s.trim()).filter(Boolean).forEach(ch => groups.set(ch, gi));
+  });
+  return groups.size ? groups : null;
 }
 
 // ---------- options reader ----------
@@ -571,11 +874,14 @@ function readOpts() {
     colorBy: $("colorBy").value,
     sizeBy: $("sizeBy").value,
     edgeFilter: $("edgeFilter").value,
+    edgeColorBy: $("edgeColorBy").value,
     cutoff: parseFloat($("cutoff").value),
     atomScope: $("atomScope").value,
     covalentOnly: $("covalentOnly").checked,
     intraChain: $("intraChain").checked,
     interChain: $("interChain").checked,
+    interProtomer: $("interProtomer").checked,
+    protomerGroups: parseProtomerGroups($("protomerGroups").value),
     excludeSeqAdj: $("excludeSeqAdj").checked,
     includeHetatm: $("includeHetatm").checked
   };
@@ -586,11 +892,11 @@ function prepareAtoms(opts) {
   if (opts.assemblyMode === "monomer") {
     const firstChain = atoms.find(a=>!a.hetatm)?.chain;
     atoms = atoms.filter(a => a.chain === firstChain);
-    atoms = atoms.map(a=>({...a, opId:0}));
+    atoms = atoms.map(a=>({...a, opId:0, baseChain:a.chain}));
   } else if (opts.assemblyMode === "bioassembly") {
     atoms = applyBiomt(atoms, parsed.biomt);
   } else {
-    atoms = atoms.map(a=>({...a, opId:0}));
+    atoms = atoms.map(a=>({...a, opId:0, baseChain:a.chain}));
   }
   return atoms;
 }
@@ -637,12 +943,37 @@ $("buildBtn").addEventListener("click", () => {
     render(graph, opts);
     $("exportBtn").disabled = false;
     $("exportJsonBtn").disabled = false;
-    const interN = graph.links.filter(l=>l.inter).length;
-    const bondN = graph.links.filter(l=>l.bond).length;
-    const contactN = graph.links.length - bondN;
+    const byScope = {intra:0, intra_protomer:0, homotypic:0, heterotypic:0, inter_protomer:0};
+    graph.links.forEach(l => byScope[l.scope] = (byScope[l.scope]||0)+1);
+    const byType = {};
+    graph.links.forEach(l => byType[l.type] = (byType[l.type]||0)+1);
+    const labels = {peptide:"peptide",disulfide:"disulfide",covalent:"covalent",
+      salt_bridge:"salt bridge",hydrogen_bond:"H-bond",hydrophobic:"hydrophobic",vdw:"vdW"};
+    const order = ["peptide","disulfide","covalent","salt_bridge","hydrogen_bond","hydrophobic","vdw"];
+    const typeStr = order.filter(t=>byType[t])
+      .map(t=>`${labels[t]}: <b>${byType[t]}</b>`).join(" · ");
+    const scopeOrder = [["intra","intra-chain"],["intra_protomer","intra-protomer"],
+      ["homotypic","homotypic"],["heterotypic","heterotypic"],["inter_protomer","inter-protomer"]];
+    const scopeStr = scopeOrder.filter(([k])=>byScope[k])
+      .map(([k,lab])=>`${lab}: <b>${byScope[k]}</b>`).join(" · ");
+    // sequence-cluster summary: which chains are the same protein
+    let clusterStr = "";
+    if (graph.meta && graph.meta.cluster) {
+      const byClu = new Map();
+      for (const [ch, cid] of graph.meta.cluster) {
+        if (!byClu.has(cid)) byClu.set(cid, []);
+        byClu.get(cid).push(ch);
+      }
+      const multi = [...byClu.values()].filter(a=>a.length>1);
+      if (multi.length)
+        clusterStr = "<br>same-sequence groups: " +
+          multi.map(a=>a.join("≡")).join(", ");
+    }
     $("stats").innerHTML = $("stats").innerHTML.split("<br><b>Network:</b>")[0]
       + `<br><b>Network:</b> ${graph.nodes.length} nodes, ${graph.links.length} edges`
-      + `<br>${bondN} bonds · ${contactN} contacts · ${interN} inter-chain`;
+      + `<br>${typeStr}`
+      + `<br>${scopeStr}`
+      + clusterStr;
     $("buildBtn").textContent = "Build Network"; $("buildBtn").disabled = false;
   }, 20);
 });
@@ -661,16 +992,18 @@ function reStyle() {
 }
 $("colorBy").addEventListener("change", reStyle);
 $("sizeBy").addEventListener("change", reStyle);
+$("edgeFilter").addEventListener("change", reStyle);
+$("edgeColorBy").addEventListener("change", reStyle);
 
 $("exportBtn").addEventListener("click", () => {
   if (!graph) return;
-  const header = "source,target,source_label,target_label,distance,count,edge_type,inter_chain\n";
+  const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond\n";
   const rows = graph.links.map(l => {
     const s = graph.nodes.find(n=>n.id===idOf(l.source));
     const t = graph.nodes.find(n=>n.id===idOf(l.target));
     return [s.id, t.id, s.title, t.title,
       (typeof l.dist==="number") ? l.dist.toFixed(2) : l.dist,
-      l.count||1, l.bond?"bond":"contact", l.inter?1:0].join(",");
+      l.count||1, l.type, l.scope, l.bond?1:0].join(",");
   }).join("\n");
   download(header+rows, "pampano_edges.csv", "text/csv");
 });
@@ -678,11 +1011,12 @@ $("exportBtn").addEventListener("click", () => {
 $("exportJsonBtn").addEventListener("click", () => {
   if (!graph) return;
   const clean = {
-    nodes: graph.nodes.map(n=>({id:n.id, label:n.label, chain:n.chain, title:n.title,
+    nodes: graph.nodes.map(n=>({id:n.id, label:n.label, chain:n.chain,
+      base_chain:n.baseChain, operator:n.opId, title:n.title,
       resName:n.resName, hydropathy:n.hydro, volume:n.vol, sasa:n.sasa, degree:n.degree})),
     links: graph.links.map(l=>({source:idOf(l.source), target:idOf(l.target),
-      distance:l.dist, count:l.count||1, edge_type:l.bond?"bond":"contact",
-      inter_chain:!!l.inter}))
+      distance:l.dist, count:l.count||1, interaction:l.type, scope:l.scope,
+      is_bond:!!l.bond}))
   };
   download(JSON.stringify(clean,null,2), "pampano_network.json", "application/json");
 });
