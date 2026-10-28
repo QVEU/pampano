@@ -631,11 +631,16 @@ function hbondGeometryOK(atoms, geom, ia, ib) {
   return okAsAcceptor(ib, ia) || okAsAcceptor(ia, ib);
 }
 
-// priority when collapsing many atom-pair interactions into one residue edge
+// priority when collapsing many atom-pair interactions into one residue edge.
+// Lower index = stronger/more-specific; the strongest interaction labels the edge.
 const INTERACTION_PRIORITY = ["disulfide","peptide","covalent","salt_bridge","hydrogen_bond","hydrophobic","vdw"];
 function strongerInteraction(a, b) {
-  if (!a) return b; if (!b) return a;
-  return INTERACTION_PRIORITY.indexOf(a) <= INTERACTION_PRIORITY.indexOf(b) ? a : b;
+  if (!a) return b;
+  if (!b) return a;
+  const ia = INTERACTION_PRIORITY.indexOf(a), ib = INTERACTION_PRIORITY.indexOf(b);
+  const ra = ia === -1 ? Infinity : ia;   // unknown values rank weakest
+  const rb = ib === -1 ? Infinity : ib;
+  return ra <= rb ? a : b;                 // keep the lower index (stronger)
 }
 
 // does this scope pass the include/exclude option checkboxes?
