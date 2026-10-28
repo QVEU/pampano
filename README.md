@@ -22,7 +22,8 @@
 - **Assembly**
   - *Monomer* — the first protein chain only.
   - *Full asymmetric unit* — every chain exactly as deposited.
-  - *Biological assembly* — applies the `REMARK 350` BIOMT symmetry operators of biological assembly 1 (each to the chains it lists) to rebuild the biologically relevant multimer. If the file has no BIOMT records, this falls back to the asymmetric unit.
+  - *Biological assembly* — applies the `REMARK 350` BIOMT symmetry operators of biological assembly 1 (each to the chains it lists) to rebuild the biologically relevant multimer. If the file has no BIOMT records, this falls back to the asymmetric unit. Every symmetry copy becomes its own set of nodes (chains are renamed `A_1`, `A_2`, …), so a 60-mer virus capsid is about 60 times the size of its asymmetric unit.
+  - *Bio-assembly contacts on asym unit* — builds the same assembly but keeps only one copy of each chain as nodes. Contacts with neighbouring symmetry copies are mapped back onto that copy, so the network is the size of the asymmetric unit yet carries every interface of the full assembly (scored as inter-protomer, homotypic or heterotypic). Use this for icosahedral capsids and other large assemblies. A contact between a residue and its own symmetry copy (e.g. across a 5-fold axis) has no edge, since both ends are the same node; the stats panel counts these.
 
 ### Network definition
 
@@ -69,7 +70,7 @@ Click any node to open a structural view (bottom-left) of that residue and the r
   - **Homotypic** — the two chains have the *same* sequence (the same protein — typical of a homo-oligomer protomer interface).
   - **Heterotypic** — the two chains have *different* sequences (different proteins — a true hetero-complex interface).
 - **Intra-protomer** — The two chains belong to the *same* manually defined protomer group (set via **Protomer groups**). Represents an interface internal to a multi-chain protomer.
-- **Inter-protomer** — The two atoms are the same original chain under *different* BIOMT symmetry operators (e.g. A and A′). These interfaces exist only once the biological assembly is built. Only appears in biological-assembly mode.
+- **Inter-protomer** — The two atoms are the same original chain under *different* BIOMT symmetry operators (e.g. A and A′). These interfaces exist only once the biological assembly is built. Only appears in the two biological-assembly modes.
 
 > **Why both homotypic/heterotypic and intra/inter-protomer?** Chain labels (A, B, C…) are assigned by whoever deposited the structure and don't inherently tell you which chains form one functional unit. Pampano classifies inter-chain contacts automatically by sequence identity (which is unambiguous within a single structure), and lets you override that with explicit protomer groups when the biological grouping is something only you know.
 
@@ -119,7 +120,7 @@ Each edge records which part of each partner is involved: **backbone** (N, CA, C
 - **SASA is computed on the current selection.** A residue buried in the full complex will look artificially exposed if you compute SASA on an isolated monomer. Build the biological assembly for meaningful burial values. SASA is also the most computationally intensive step on large all-atom selections.
 - **Hydrogen bonds are approximate.** Without explicit hydrogens the geometry check is a heavy-atom surrogate; His is treated as potentially positive regardless of protonation state. This is standard for heavy-atom contact networks but will differ somewhat from dedicated tools (DSSP, HBPLUS).
 - **CA-only mode cannot resolve bond chemistry.** With only alpha carbons present, true covalent geometry is unavailable; the backbone is approximated from CA(i)–CA(i+1) adjacency.
-- **Biological assemblies multiply atom count** by the number of symmetry operators, so large assemblies are best viewed at residue-level granularity.
+- **Biological assemblies multiply atom count** by the number of symmetry operators. Above about 5,000 nodes or 30,000 edges the network is still built and exported but not drawn, because the force layout would freeze the browser (a full 60-mer capsid such as 3VBS is ~50,000 residue nodes). Use *Bio-assembly contacts on asym unit* for those.
 - **Sequence classification uses exact identity.** Within one structure, copies of the same protein share an identical sequence; any difference marks a different protein. There's no fuzzy matching, so it cannot misclassify.
 
 ---
