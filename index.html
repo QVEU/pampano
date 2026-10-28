@@ -69,6 +69,11 @@
     padding: 8px 12px; background: #1b2029; font-size: 12px; font-weight: 600;
     border-bottom: 1px solid #262b36;
   }
+  #tooBig { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    max-width: 440px; background: #171a21; border: 1px solid #2c3340; border-radius: 10px;
+    padding: 16px 18px; font-size: 13px; line-height: 1.6; color: #cbd2dd; }
+  #tooBig b { color: #e6e8eb; }
+  #tooBig button { width: auto; padding: 8px 14px; }
   #insetClose { cursor: pointer; color: #8b93a1; font-size: 16px; line-height: 1; }
   #insetClose:hover { color: #e6e8eb; }
   #insetCanvas { width: 280px; height: 220px; background: #0b0d11; cursor: grab; }
@@ -133,6 +138,7 @@
     <option value="monomer">Monomer (first chain)</option>
     <option value="asym">Full asymmetric unit (all chains as-is)</option>
     <option value="bioassembly">Biological assembly (apply BIOMT)</option>
+    <option value="biocontacts">Bio-assembly contacts on asym unit (one copy, symmetry-mate contacts mapped back)</option>
   </select>
   <div class="note" id="asmNote"></div>
 
@@ -223,6 +229,7 @@
   <svg id="graph"></svg>
   <div id="tooltip"></div>
   <div class="legend" id="legend" style="display:none"></div>
+  <div id="tooBig" style="display:none"></div>
   <div id="inset" style="display:none">
     <div id="insetHeader">
       <span id="insetTitle">Residue view</span>
@@ -388,7 +395,7 @@ function applyBiomt(atoms, biomt) {
     for (const a of atoms) {
       if (op.chains && !op.chains.has(a.chain)) continue;
       out.push({
-        ...a, opId: oi, baseChain: a.chain,
+        ...a, opId: oi, baseChain: a.chain, src: a,
         x: r0[0]*a.x + r0[1]*a.y + r0[2]*a.z + t[0],
         y: r1[0]*a.x + r1[1]*a.y + r1[2]*a.z + t[1],
         z: r2[0]*a.x + r2[1]*a.y + r2[2]*a.z + t[2],
@@ -397,6 +404,31 @@ function applyBiomt(atoms, biomt) {
     }
   });
   return out;
+}
+
+// Symmetry-reduced bio-assembly: keep one copy of each chain (its first BIOMT
+// operator) as the "primary" copy, plus only those symmetry-mate atoms close
+// enough to touch it. Mates are flagged mate:true; buildGraph maps their contacts
+// back onto the primary copy, so a 60-mer capsid gives a network the size of one
+// asymmetric unit that still carries every interface the full assembly has.
+function symmetryMateAtoms(atoms, opts) {
+  const primaryOp = new Map();   // baseChain -> first operator applied to it
+  for (const a of atoms) if (!primaryOp.has(a.baseChain)) primaryOp.set(a.baseChain, a.opId);
+  const primary = [], others = [];
+  for (const a of atoms) (primaryOp.get(a.baseChain) === a.opId ? primary : others).push(a);
+  // grid over primary atoms; a mate atom is kept if any primary atom sits in a
+  // neighbouring cell (cell >= search radius, so no contact can be missed)
+  const cell = Math.max(opts.cutoff || 0, COVALENT_SEARCH), grid = new Set();
+  const key = (i,j,k) => i+","+j+","+k;
+  for (const a of primary) grid.add(key(Math.floor(a.x/cell), Math.floor(a.y/cell), Math.floor(a.z/cell)));
+  const near = a => {
+    const i = Math.floor(a.x/cell), j = Math.floor(a.y/cell), k = Math.floor(a.z/cell);
+    for (let di=-1; di<=1; di++) for (let dj=-1; dj<=1; dj++) for (let dk=-1; dk<=1; dk++)
+      if (grid.has(key(i+di,j+dj,k+dk))) return true;
+    return false;
+  };
+  const mates = others.filter(near).map(a => ({...a, mate: true}));
+  return primary.concat(mates);
 }
 
 // ---------- atom selection ----------
@@ -744,10 +776,23 @@ function buildGraph(atoms, opts) {
     heavy.forEach((a,i)=> atomSASA.set(a, s[i]));
   }
 
+  // symmetry-reduced mode: home[i] is the primary-copy atom that sel[i] stands
+  // for (itself unless sel[i] is a symmetry mate). Nodes come from primary atoms
+  // only; a mate's contacts are credited to its primary counterpart.
+  const hasMates = sel.some(a => a.mate);
+  const home = sel.map((a,i) => i);
+  if (hasMates) {
+    const bySrc = new Map();
+    sel.forEach((a,i) => { if (!a.mate) bySrc.set(a.src, i); });
+    sel.forEach((a,i) => { if (a.mate) home[i] = bySrc.get(a.src); });
+  }
+  let selfSymPairs = 0;   // atom pairs between a residue and its own symmetry copy
+
   // classify every atom pair once; drop pairs whose scope is switched off
   const contacts = [];
   for (const [i,j,d] of pairs) {
     const a = sel[i], b = sel[j];
+    if (a.mate && b.mate) continue;   // mate–mate pairs repeat a primary–mate pair
     const scope = contactScope(a, b, ctx);
     if (!scopeIncluded(scope, opts)) continue;
     const {type, bond} = classifyPair(a, b, d, sel, geom, i, j, caOnly);
@@ -757,7 +802,10 @@ function buildGraph(atoms, opts) {
 
   let nodes, links;
   if (opts.granularity === "atom") {
-    nodes = sel.map((a,i) => ({
+    const nodeOf = new Map();   // sel index -> node id (primary atoms only)
+    const prim = [];
+    sel.forEach((a,i) => { if (!a.mate) { nodeOf.set(i, prim.length); prim.push(a); } });
+    nodes = prim.map((a,i) => ({
       id: i, label: a.name,
       group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId, copyId: a.copyId ?? 0,
       hetatm: a.hetatm,
@@ -770,13 +818,28 @@ function buildGraph(atoms, opts) {
       resclass: RESCLASS[a.resName] || "unknown",
       title: `${a.chain} ${a.resName}${a.resSeq}${a.iCode||""} ${a.name}`
     }));
-    links = contacts.map(c => ({source:c.i, target:c.j, dist:c.d,
+    // a mate contact can land on an atom pair that already has one (the same
+    // interface seen from either side, or an intra-copy contact); keep one link
+    // per atom pair, labelled by its strongest interaction and closest distance
+    const atomLinks = new Map();
+    for (const c of contacts) {
+      const s = nodeOf.get(home[c.i]), t = nodeOf.get(home[c.j]);
+      if (s === t) { selfSymPairs++; continue; }
+      const k = Math.min(s,t)+"-"+Math.max(s,t), prev = atomLinks.get(k);
+      const cur = {...c, i:s, j:t};
+      if (!prev) { atomLinks.set(k, cur); continue; }
+      const won = strongerInteraction(prev.type, cur.type);
+      const keep = won === prev.type && (won !== cur.type || prev.d <= cur.d) ? prev : cur;
+      atomLinks.set(k, {...keep, d: Math.min(prev.d, cur.d), scope: mergeScoperank(prev.scope, cur.scope), bond: prev.bond || cur.bond});
+    }
+    links = [...atomLinks.values()].map(c => ({source:c.i, target:c.j, dist:c.d,
       type:c.type, scope:c.scope, inter:c.scope !== "intra", bond:c.bond,
       sourcePart:c.pi, targetPart:c.pj, partCounts:{[`${PART_ABBR[c.pi]}-${PART_ABBR[c.pj]}`]:1}}));
   } else {
     // residue-level: collapse atom pairs to residue-residue edges
     const resMap = new Map();
     sel.forEach(a => {
+      if (a.mate) return;
       const k = residueKey(a);
       if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, baseChain:a.baseChain,
         opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, copyId:a.copyId??0,
@@ -792,9 +855,9 @@ function buildGraph(atoms, opts) {
     // by "source-target" part, e.g. {"bb-sc": 3, "sc-sc": 12}.
     const edgeAgg = new Map(); // "lo-hi" -> edge
     for (const c of contacts) {
-      const ri = resIndex.get(residueKey(sel[c.i])), rj = resIndex.get(residueKey(sel[c.j]));
-      if (ri === rj) continue;
-      if (opts.excludeSeqAdj && isSeqNeighbor(resList[ri], resList[rj])) continue;
+      const ri = resIndex.get(residueKey(sel[home[c.i]])), rj = resIndex.get(residueKey(sel[home[c.j]]));
+      if (ri === rj) { if (c.i !== home[c.i] || c.j !== home[c.j]) selfSymPairs++; continue; }
+      if (opts.excludeSeqAdj && isSeqNeighbor(sel[c.i], sel[c.j])) continue;
       const lo = Math.min(ri,rj), hi = Math.max(ri,rj), ek = lo+"-"+hi;
       let e = edgeAgg.get(ek);
       if (!e) edgeAgg.set(ek, e = {source:lo, target:hi, dist:Infinity, count:0,
@@ -841,16 +904,16 @@ function buildGraph(atoms, opts) {
     links = edges.map(({typeDist, ...e}) => ({...e, source:remap.get(e.source), target:remap.get(e.target)}));
   }
 
-  // index the selected atoms per residue for the 3D inset
-  sceneAtoms = sel;
+  // index the selected atoms per residue for the 3D inset (primary copy only)
+  sceneAtoms = hasMates ? sel.filter(a => !a.mate) : sel;
   resAtomIndex = new Map();
-  for (const a of sel) {
+  for (const a of sceneAtoms) {
     const k = residueKey(a);
     if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
     resAtomIndex.get(k).push(a);
   }
 
-  return {nodes, links, meta:{seqs, cluster}};
+  return {nodes, links, meta:{seqs, cluster, mateAtoms: hasMates ? sel.length - sceneAtoms.length : 0, selfSymPairs}};
 }
 
 // ---------- rendering ----------
@@ -889,6 +952,7 @@ function formatPartCounts(pc) {
   return Object.entries(pc || {}).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}:${v}`).join(";");
 }
 
+const MAX_DRAW_NODES = 5000, MAX_DRAW_LINKS = 30000;
 function render(g, opts) {
   const svg = d3.select("#graph");
   if (sim) sim.stop();           // the old simulation would keep moving the same nodes
@@ -904,6 +968,25 @@ function render(g, opts) {
   const deg = new Array(g.nodes.length).fill(0);
   shownLinks.forEach(l => { deg[idOf(l.source)]++; deg[idOf(l.target)]++; });
   g.nodes.forEach((n,i)=> n.degree = deg[i]);
+
+  // An SVG force layout redraws every node and edge on every tick; past a few
+  // thousand nodes a single tick takes seconds and the tab locks up (a 60-mer
+  // capsid is ~50k residue nodes / ~300k edges). Keep the network (stats and
+  // exports still work) but don't draw it unless the user insists.
+  const tooBig = g.nodes.length > MAX_DRAW_NODES || shownLinks.length > MAX_DRAW_LINKS;
+  $("tooBig").style.display = tooBig && !opts.forceDraw ? "block" : "none";
+  if (tooBig && !opts.forceDraw) {
+    $("legend").style.display = "none";
+    $("tooBig").innerHTML = `<b>Network too large to draw</b><br>`
+      + `${g.nodes.length.toLocaleString()} nodes and ${shownLinks.length.toLocaleString()} edges would freeze the browser `
+      + `(drawing is practical up to about ${MAX_DRAW_NODES.toLocaleString()} nodes / ${MAX_DRAW_LINKS.toLocaleString()} edges). `
+      + `The network is built: the stats are on the left and both exports work.<br><br>`
+      + `To get a drawable network, try <b>Bio-assembly contacts on asym unit</b> (one copy of each chain with every `
+      + `symmetry-mate contact mapped onto it), the <b>CA/representative</b> atom scope, or a narrower <b>Show edges</b> filter.`
+      + `<br><button class="secondary" id="drawAnyway">Draw anyway (may hang the tab)</button>`;
+    $("drawAnyway").onclick = () => render(g, {...readOpts(), forceDraw: true});
+    return;
+  }
 
   const chains = [...new Set(g.nodes.map(n=>n.chain))];
   const chainColor = d3.scaleOrdinal(d3.schemeTableau10).domain(chains);
@@ -1326,7 +1409,9 @@ function readOpts() {
 
 function prepareAtoms(opts) {
   let atoms = parsed.atoms;
-  if (opts.assemblyMode === "monomer") {
+  if (opts.assemblyMode === "biocontacts") {
+    atoms = symmetryMateAtoms(applyBiomt(atoms, parsed.biomt), opts);
+  } else if (opts.assemblyMode === "monomer") {
     const firstChain = atoms.find(a=>!a.hetatm)?.chain;
     atoms = atoms.filter(a => a.chain === firstChain);
     atoms = atoms.map(a=>({...a, opId:0, baseChain:a.chain}));
@@ -1374,9 +1459,9 @@ function loadText(text, name) {
 
 $("buildBtn").addEventListener("click", () => {
   const opts = readOpts();
-  const atoms = prepareAtoms(opts);
   $("buildBtn").textContent = "Building…"; $("buildBtn").disabled = true;
   setTimeout(() => {
+    const atoms = prepareAtoms(opts);
     graph = buildGraph(atoms, opts);
     render(graph, opts);
     $("exportBtn").disabled = false;
@@ -1411,7 +1496,11 @@ $("buildBtn").addEventListener("click", () => {
       + `<br><b>Network:</b> ${graph.nodes.length} nodes, ${graph.links.length} edges`
       + `<br>${typeStr}`
       + `<br>${scopeStr}`
-      + clusterStr;
+      + clusterStr
+      + (graph.meta.mateAtoms ? `<br>symmetry mates: ${graph.meta.mateAtoms.toLocaleString()} nearby atoms from `
+        + `${new Set(atoms.filter(a=>a.mate).map(a=>a.opId)).size} other copies, contacts mapped onto the primary copy`
+        + (graph.meta.selfSymPairs ? ` (${graph.meta.selfSymPairs.toLocaleString()} atom pairs between a residue and its own symmetry copy have no edge)` : "")
+        : "");
     $("buildBtn").textContent = "Build Network"; $("buildBtn").disabled = false;
   }, 20);
 });
@@ -1451,8 +1540,7 @@ $("exportBtn").addEventListener("click", () => {
   if (!graph) return;
   const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond,source_part,target_part,part_counts\n";
   const rows = graph.links.map(l => {
-    const s = graph.nodes.find(n=>n.id===idOf(l.source));
-    const t = graph.nodes.find(n=>n.id===idOf(l.target));
+    const s = graph.nodes[idOf(l.source)], t = graph.nodes[idOf(l.target)];
     return [s.id, t.id, s.title, t.title,
       (typeof l.dist==="number") ? l.dist.toFixed(2) : l.dist,
       l.count||1, l.type, l.scope, l.bond?1:0,
@@ -1483,7 +1571,7 @@ function download(content, name, type) {
 }
 
 $("assemblyMode").addEventListener("change", e => {
-  $("asmNote").textContent = e.target.value === "bioassembly" && parsed && !parsed.biomt.length
+  $("asmNote").textContent = /^bio/.test(e.target.value) && parsed && !parsed.biomt.length
     ? "No BIOMT records; will use asym unit." : "";
 });
 
@@ -1504,7 +1592,7 @@ const README = String.raw`# Pampano
 
 ### Loading & assembly
 - **PDB file / Fetch by ID** — provide the structure either way. Fetch needs an internet connection and a valid RCSB entry.
-- **Assembly** — *Monomer* (first chain only), *Full asymmetric unit* (all chains as deposited), or *Biological assembly* (applies the REMARK 350 BIOMT operators of biological assembly 1, each to the chains it lists, to rebuild the multimer; falls back to the asymmetric unit if no BIOMT records exist).
+- **Assembly** — *Monomer* (first chain only), *Full asymmetric unit* (all chains as deposited), or *Biological assembly* (applies the REMARK 350 BIOMT operators of biological assembly 1, each to the chains it lists, to rebuild the multimer; falls back to the asymmetric unit if no BIOMT records exist; every symmetry copy gets its own nodes), or *Bio-assembly contacts on asym unit* (one copy of each chain as nodes, with every contact to a neighbouring symmetry copy mapped back onto it: the size of the asymmetric unit with all the assembly's interfaces; use it for capsids and other large assemblies).
 
 ### Network definition
 - **Granularity** — *Residue-level* (one node per residue; edges aggregate atom-atom contacts, keeping the closest distance and pair count) or *Atom-level* (one node per atom; more detailed, heavier).
@@ -1542,7 +1630,7 @@ Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, io
   - **Homotypic** — the two chains have the *same* sequence (same protein; typical homo-oligomer protomer interface).
   - **Heterotypic** — the two chains have *different* sequences (different proteins; a true hetero-complex interface).
 - **Intra-protomer** — chains belonging to the *same* manually defined protomer group. An interface internal to a multi-chain protomer.
-- **Inter-protomer** — the same original chain under *different* BIOMT operators (e.g. A and A′). Exists only once the biological assembly is built; appears only in bio-assembly mode.
+- **Inter-protomer** — the same original chain under *different* BIOMT operators (e.g. A and A′). Exists only once the biological assembly is built; appears only in the bio-assembly modes.
 
 > Chain labels (A, B, C…) are assigned by the depositor and don't inherently say which chains form one functional unit. Pampano classifies inter-chain contacts by sequence identity (unambiguous within one structure) and lets you override with explicit protomer groups when the biological grouping is something only you know.
 
@@ -1583,7 +1671,7 @@ Each edge records which part of each partner is involved: **backbone** (N, CA, C
 - **SASA is computed on the current selection** — an interface buried in the full complex looks exposed on an isolated monomer. Build the biological assembly for meaningful burial. It's also the heaviest step on large all-atom selections.
 - **Hydrogen bonds are approximate** — without explicit H the geometry is a heavy-atom surrogate, and His is treated as potentially positive regardless of protonation. Expect some difference from DSSP/HBPLUS.
 - **CA-only mode cannot resolve bond chemistry** — the backbone is approximated from CA(i)–CA(i+1) adjacency.
-- **Biological assemblies multiply atom count** by the number of operators; use residue-level granularity for large ones.
+- **Biological assemblies multiply atom count** by the number of operators. Networks above ~5,000 nodes or 30,000 edges are built and exportable but not drawn (the layout would freeze the tab); use *Bio-assembly contacts on asym unit* for capsids.
 - **Sequence classification is exact** — copies of the same protein share an identical sequence within one structure, so there's no fuzzy matching and no misclassification.`;
 
 // minimal markdown → HTML (headers, lists, blockquote, hr, bold/italic/code, paragraphs)
