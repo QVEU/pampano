@@ -420,7 +420,10 @@ function buildContacts(atoms, cutoff) {
 const SCOPE_RANK = ["heterotypic","homotypic","inter_protomer","intra_protomer","intra"];
 function mergeScoperank(a, b) {
   if (!a) return b; if (!b) return a;
-  return SCOPE_RANK.indexOf(a) <= SCOPE_RANK.indexOf(b) ? a : b;
+  const ia = SCOPE_RANK.indexOf(a), ib = SCOPE_RANK.indexOf(b);
+  // unknown values rank last, never win over a known scope
+  const ra = ia === -1 ? Infinity : ia, rb = ib === -1 ? Infinity : ib;
+  return ra <= rb ? a : b;
 }
 
 // ---------- chain sequence fingerprinting ----------
@@ -444,7 +447,7 @@ function chainSequences(atoms) {
   const seqs = new Map();
   for (const [bc, resMap] of byChain) {
     const res = [...resMap.values()].sort((x,y)=>
-      x.resSeq - y.resSeq || x.iCode.localeCompare(y.iCode));
+      x.resSeq - y.resSeq || (x.iCode||"").localeCompare(y.iCode||""));
     seqs.set(bc, res.map(r => THREE_TO_ONE[r.resName] || "X").join(""));
   }
   return seqs;
@@ -665,7 +668,7 @@ function buildGraph(atoms, opts) {
       return scopeIncluded(scope, opts);
     }).map(([i,j,d]) => {
       const a = sel[i], b = sel[j];
-      const scope = contactScope(a, b, ctx);
+      const scope = contactScope(a, b, ctx) || "heterotypic";
       const peptide = isPeptideBond(a, b);
       const covalent = isCovalent(a.element, b.element, d) || peptide;
       let type;
@@ -860,7 +863,7 @@ function render(g, opts) {
     const s = g.nodes[idOf(d.source)] || d.source, t = g.nodes[idOf(d.target)] || d.target;
     const scopeLabel = {intra:"intra-chain", intra_protomer:"intra-protomer",
       homotypic:"homotypic", heterotypic:"heterotypic",
-      inter_protomer:"inter-protomer"}[d.scope] || d.scope;
+      inter_protomer:"inter-protomer"}[d.scope] || d.scope || "unclassified";
     tip.innerHTML = `<b>${(EDGE_LABELS[d.type]||d.type)}</b> · ${scopeLabel}<br>`
       + `${s.title||s.label} — ${t.title||t.label}<br>`
       + `min dist ${d.dist.toFixed(2)} Å`
@@ -913,7 +916,7 @@ function render(g, opts) {
       homotypic:"homotypic (A↔B, same seq)", heterotypic:"heterotypic (A↔B, diff seq)",
       inter_protomer:"inter-protomer (A↔A′)"};
     edgeLegend = present.map(s =>
-      `<div><span class="swatch" style="background:${SCOPE_COLORS[s]}"></span>${SCOPE_LABELS[s]}</div>`).join("");
+      `<div><span class="swatch" style="background:${SCOPE_COLORS[s]||"#4b5563"}"></span>${SCOPE_LABELS[s]||s||"unclassified"}</div>`).join("");
   } else {
     const present = [...new Set(shownLinks.map(l=>l.type))]
       .sort((a,b)=>INTERACTION_PRIORITY.indexOf(a)-INTERACTION_PRIORITY.indexOf(b));
