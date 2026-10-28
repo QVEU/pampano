@@ -22,7 +22,7 @@
 - **Assembly**
   - *Monomer* — the first protein chain only.
   - *Full asymmetric unit* — every chain exactly as deposited.
-  - *Biological assembly* — applies the structure's `REMARK 350` BIOMT symmetry operators to rebuild the biologically relevant multimer. If the file has no BIOMT records, this falls back to the asymmetric unit.
+  - *Biological assembly* — applies the `REMARK 350` BIOMT symmetry operators of biological assembly 1 (each to the chains it lists) to rebuild the biologically relevant multimer. If the file has no BIOMT records, this falls back to the asymmetric unit.
 
 ### Network definition
 
@@ -41,9 +41,9 @@
 
 ### Advanced
 
-- **Covalent bonds only** — build a network of covalent linkages alone (~1.9 Å).
+- **Covalent bonds only** — build a network of covalent linkages alone (≤ 1.95 Å; S–S ≤ 2.4 Å; X–H ≤ 1.3 Å).
 - **Include intra-chain / inter-chain / inter-protomer contacts** — toggle each structural scope on or off.
-- **Exclude sequential neighbors** — when on, removes contacts between consecutive residues so you see only tertiary/quaternary contacts. Off by default (the backbone chain is included). Covalent backbone bonds are never removed by this option when off.
+- **Exclude sequential neighbors** — when on, removes contacts between consecutive polymer residues (HETATM groups are unaffected) so you see only tertiary/quaternary contacts. Off by default (the backbone chain is included). Covalent backbone bonds are never removed by this option when off.
 - **Protomer groups** — optionally group chains into protomers (e.g. `A,B ; C,D`) to distinguish within-protomer from between-protomer interfaces. Leave blank to classify inter-chain contacts automatically by sequence.
 - **Include HETATM** — include ligands, cofactors, ions, and water.
 
@@ -79,7 +79,7 @@ Listed from strongest/most-specific to weakest. When several atom-pair interacti
 
 - **Peptide bond** — The covalent backbone linkage between consecutive residues, C(i)–N(i+1). Detected geometrically from the actual backbone atoms, not from residue numbering.
 - **Disulfide** — A covalent S–S bond between two cysteines (~2.05 Å).
-- **Covalent (other)** — Any other covalent linkage (≤ ~1.95 Å), such as ligand attachments.
+- **Covalent (other)** — Any other covalent linkage (≤ ~1.95 Å; ≤ 1.3 Å when a hydrogen is involved), such as ligand attachments.
 - **Salt bridge** — An electrostatic interaction between oppositely charged groups: a basic nitrogen (Arg, Lys, His) and an acidic oxygen (Asp, Glu) within 4.0 Å.
 - **Hydrogen bond** — A donor N/O and an acceptor N/O within 3.5 Å that also satisfy an angular geometry check (see below).
 - **Hydrophobic** — A carbon–carbon contact within 4.0 Å involving a hydrophobic residue.
