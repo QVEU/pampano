@@ -426,6 +426,25 @@ function mergeScoperank(a, b) {
   return ra <= rb ? a : b;
 }
 
+// Some structures contain multiple physically distinct copies of a residue that
+// share the same chain/resSeq/iCode/resName (e.g. a ligand present in many NCS
+// copies all labelled "A/301/SPH", often with repeating atom names/serials).
+// Collapsing them to one node is wrong, so assign each copy a distinct copyId by
+// detecting when an atom name repeats within the same residue identifier.
+function assignResidueCopies(atoms) {
+  const seen = new Map();   // resId -> {copyId, names:Set}
+  for (const a of atoms) {
+    const resId = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.opId??0}`;
+    let rec = seen.get(resId);
+    if (!rec) { rec = {copyId:0, names:new Set()}; seen.set(resId, rec); }
+    // a repeated atom name within the same residue identifier means a new copy
+    if (rec.names.has(a.name)) { rec.copyId++; rec.names = new Set(); }
+    rec.names.add(a.name);
+    a.copyId = rec.copyId;
+  }
+  return atoms;
+}
+
 // ---------- chain sequence fingerprinting ----------
 // Build a per-chain sequence string (by baseChain) so we can tell whether two
 // different chains are the same protein (homotypic) or different (heterotypic).
@@ -549,7 +568,10 @@ const HYDROPHOBIC_RES = new Set(["ALA","VAL","LEU","ILE","MET","PHE","TRP","PRO"
 
 // is this atom pair the backbone peptide bond? (C of one residue — N of the next)
 // In CA-only selections, fall back to CA(i)–CA(i+1) adjacency (~3.8 Å).
+// Never applies to HETATM (ligands like lipids can have C/N atoms that would
+// otherwise be mistaken for a backbone linkage).
 function isPeptideBond(a, b) {
+  if (a.hetatm || b.hetatm) return false;
   if (a.chain !== b.chain) return false;
   if (a.resSeq === b.resSeq) return false;
   // true backbone C–N linkage
@@ -654,7 +676,8 @@ function buildGraph(atoms, opts) {
   if (opts.granularity === "atom") {
     const nodes = sel.map((a,i) => ({
       id: i, label: a.name,
-      group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId,
+      group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId, copyId: a.copyId,
+      hetatm: a.hetatm,
       resName: a.resName, resSeq: a.resSeq, iCode: a.iCode, atomRef: a,
       hydro: KD[a.resName] ?? null,
       vol: VOL[a.resName] ?? null,
@@ -677,26 +700,27 @@ function buildGraph(atoms, opts) {
         type = (a.element==="S" && b.element==="S") ? "disulfide" : "covalent";
       else type = classifyInteraction(a, b, d, sel, geom, i, j);
       return {source:i, target:j, dist:d, scope,
-        inter: scope !== "intra", bond: covalent, type};
+        inter: scope !== "intra", bond: covalent, type: type || "vdw"};
     });
     sceneAtoms = sel;
     resAtomIndex = new Map();
     for (const a of sel) {
-      const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}`;
+      const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
       if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
       resAtomIndex.get(k).push(a);
     }
-    nodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq}|${n.iCode||""}|${n.resName}`; });
+    nodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq}|${n.iCode||""}|${n.resName}|${n.copyId??0}`; });
     return {nodes, links, meta:{seqs, cluster}};
   }
 
   // residue-level: collapse pairs to residue-residue
-  const resKey = a => `${a.chain}|${a.resSeq}|${a.iCode}|${a.resName}`;
+  const resKey = a => `${a.chain}|${a.resSeq}|${a.iCode}|${a.resName}|${a.copyId??0}`;
   const resMap = new Map();
   sel.forEach(a => {
     const k = resKey(a);
     if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, baseChain:a.baseChain,
-      opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, sasa:0});
+      opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, copyId:a.copyId??0,
+      hetatm:a.hetatm, sasa:0});
     if (atomSASA && atomSASA.has(a)) resMap.get(k).sasa += atomSASA.get(a);
   });
   const resList = [...resMap.values()];
@@ -720,7 +744,7 @@ function buildGraph(atoms, opts) {
 
   const nodes = resList.map((r,i)=>({
     id:i, label:`${r.resName}${r.resSeq}`, group:r.chain, chain:r.chain,
-    baseChain:r.baseChain, opId:r.opId,
+    baseChain:r.baseChain, opId:r.opId, copyId:r.copyId, hetatm:r.hetatm,
     resName:r.resName, resSeq:r.resSeq, iCode:r.iCode,
     hydro: KD[r.resName] ?? null,
     vol: VOL[r.resName] ?? null,
@@ -741,11 +765,11 @@ function buildGraph(atoms, opts) {
   sceneAtoms = sel;
   resAtomIndex = new Map();
   for (const a of sel) {
-    const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}`;
+    const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
     if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
     resAtomIndex.get(k).push(a);
   }
-  fnodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq||""}|${n.iCode||""}|${n.resName}`; });
+  fnodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq||""}|${n.iCode||""}|${n.resName}|${n.copyId??0}`; });
 
   return {nodes:fnodes, links:flinks, meta:{seqs, cluster}};
 }
@@ -873,7 +897,17 @@ function render(g, opts) {
   const node = zoomG.append("g").selectAll("g").data(g.nodes).enter().append("g")
     .attr("class","node").call(drag());
 
-  node.append("circle").attr("r", d=>d.r).attr("fill", colorFn)
+  // polymer residues → circles; HETATM (ligands/ions/water) → squares
+  const polymerNodes = node.filter(d => !d.hetatm);
+  const hetNodes = node.filter(d => d.hetatm);
+  polymerNodes.append("circle").attr("r", d=>d.r).attr("fill", colorFn)
+    .style("cursor", "pointer");
+  hetNodes.append("rect")
+    .attr("x", d=>-d.r).attr("y", d=>-d.r)
+    .attr("width", d=>d.r*2).attr("height", d=>d.r*2)
+    .attr("rx", 1.5)
+    .attr("fill", colorFn)
+    .attr("stroke", "#e6e8eb").attr("stroke-width", 1)
     .style("cursor", "pointer");
   node.on("click", (e,d) => { e.stopPropagation(); selectNode(d); highlightSelection(d.id); });
   if (g.nodes.length <= 300)
@@ -919,12 +953,21 @@ function render(g, opts) {
       `<div><span class="swatch" style="background:${SCOPE_COLORS[s]||"#4b5563"}"></span>${SCOPE_LABELS[s]||s||"unclassified"}</div>`).join("");
   } else {
     const present = [...new Set(shownLinks.map(l=>l.type))]
+      .filter(t => t != null)
       .sort((a,b)=>INTERACTION_PRIORITY.indexOf(a)-INTERACTION_PRIORITY.indexOf(b));
     edgeLegend = present.map(t =>
       `<div><span class="swatch" style="background:${EDGE_COLORS[t]||"#4b5563"}"></span>${EDGE_LABELS[t]||t}</div>`).join("");
+    if (!edgeLegend) edgeLegend = `<div style="color:#6b7280">no edges shown</div>`;
   }
+  const hasHet = g.nodes.some(n => n.hetatm);
+  const shapeKey = hasHet
+    ? `<div style="font-weight:600;margin:6px 0 4px">Nodes</div>`
+      + `<div><span class="swatch" style="background:#8b93a1;border-radius:50%"></span>residue (circle)</div>`
+      + `<div><span class="swatch" style="background:#8b93a1;border:1px solid #e6e8eb"></span>HETATM (square)</div>`
+    : "";
   lg.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${legendTitle}</div>`
     + legendItems.map(([c,t])=>`<div><span class="swatch" style="background:${c}"></span>${t}</div>`).join("")
+    + shapeKey
     + `<div style="font-weight:600;margin:6px 0 4px">Edges</div>` + edgeLegend;
 }
 
@@ -943,9 +986,9 @@ function highlightSelection(nodeId) {
     if (s === nodeId) neigh.add(t);
     if (t === nodeId) neigh.add(s);
   });
-  d3.select("#graph").selectAll(".node circle")
-    .attr("stroke", d => d.id===nodeId ? "#ffffff" : (neigh.has(d.id) ? "#ffffff" : "#0f1115"))
-    .attr("stroke-width", d => d.id===nodeId ? 3 : (neigh.has(d.id) ? 1.8 : 1.5))
+  d3.select("#graph").selectAll(".node circle, .node rect")
+    .attr("stroke", d => d.id===nodeId ? "#ffffff" : (neigh.has(d.id) ? "#ffffff" : (d.hetatm ? "#e6e8eb" : "#0f1115")))
+    .attr("stroke-width", d => d.id===nodeId ? 3 : (neigh.has(d.id) ? 1.8 : (d.hetatm ? 1 : 1.5)))
     .attr("opacity", d => neigh.has(d.id) ? 1 : 0.35);
   d3.select("#graph").selectAll(".link")
     .attr("stroke-opacity", l => {
@@ -954,8 +997,10 @@ function highlightSelection(nodeId) {
     });
 }
 function clearHighlight() {
-  d3.select("#graph").selectAll(".node circle")
-    .attr("stroke", "#0f1115").attr("stroke-width", 1.5).attr("opacity", 1);
+  d3.select("#graph").selectAll(".node circle, .node rect")
+    .attr("stroke", d => d.hetatm ? "#e6e8eb" : "#0f1115")
+    .attr("stroke-width", d => d.hetatm ? 1 : 1.5)
+    .attr("opacity", 1);
   d3.select("#graph").selectAll(".link")
     .attr("stroke-opacity", d => d.bond ? 0.95 : 0.55);
 }
@@ -1034,7 +1079,7 @@ const inset3d = (() => {
     pos.forEach(p=> maxR = Math.max(maxR, p.length()));
     dist = maxR*2.6 + 4;
 
-    const resKeyOf = a => `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}`;
+    const resKeyOf = a => `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
 
     // atoms as spheres
     atoms.forEach((a,i)=>{
@@ -1198,6 +1243,7 @@ function prepareAtoms(opts) {
   } else {
     atoms = atoms.map(a=>({...a, opId:0, baseChain:a.chain}));
   }
+  assignResidueCopies(atoms);
   return atoms;
 }
 
@@ -1386,6 +1432,9 @@ const README = String.raw`# Pampano
 
 ### 3D inset
 Click any node to open a structural view of that residue and the residues it contacts. The selected residue shows full side-chain atoms and is highlighted; context and sequential residues show as backbone only, for orientation. Drag to rotate, scroll to zoom; background or × closes it.
+
+### Node shapes
+Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, ions, water) are drawn as **squares** with a light outline, so non-polymer components stand out. HETATM nodes appear only when **Include HETATM** is on, and carry no hydropathy/volume/SASA values (they fall back to a neutral color under those coloring modes).
 
 ## Exports
 - **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, and covalent-bond flag per edge.
