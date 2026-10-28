@@ -176,7 +176,7 @@
 
   <details>
     <summary>Advanced</summary>
-    <label><input type="checkbox" id="covalentOnly"> Covalent bonds only (~1.9 Å)</label>
+    <label><input type="checkbox" id="covalentOnly"> Covalent bonds only (≤1.95 Å, S–S ≤2.4 Å)</label>
     <label><input type="checkbox" id="intraChain" checked> Include intra-chain contacts</label>
     <label><input type="checkbox" id="interChain" checked> Include inter-chain contacts (A↔B)</label>
     <label><input type="checkbox" id="interProtomer" checked> Include inter-protomer contacts (A↔A′, bio-assembly)</label>
@@ -230,6 +230,16 @@
     </div>
     <div id="insetCanvas"></div>
     <div id="insetInfo"></div>
+  </div>
+</div>
+
+<div id="helpModal" class="modal-backdrop" style="display:none">
+  <div class="modal">
+    <div class="modal-head">
+      <span>Pampano — Help &amp; Glossary</span>
+      <span id="helpClose" class="modal-close" title="Close">×</span>
+    </div>
+    <div class="modal-body" id="helpBody"></div>
   </div>
 </div>
 
@@ -312,8 +322,11 @@ function computeSASA(atoms, probe=1.4, nSphere=92) {
 // ---------- PDB parsing ----------
 function parsePDB(text) {
   const atoms = [];
-  const biomt = []; // list of {matrix:[[..],[..],[..]], trans:[x,y,z]} per operator
-  let curOp = null;
+  // REMARK 350 operators of biomolecule 1 only: {matrix, trans, chains:Set|null}.
+  // Later biomolecules are alternative assemblies, not extra copies, so applying
+  // them too would stack duplicate chains on top of each other.
+  const biomt = [];
+  let curOp = null, mol = null, applyChains = null;
   const lines = text.split(/\r?\n/);
 
   for (const line of lines) {
@@ -338,20 +351,28 @@ function parsePDB(text) {
       // keep only first altLoc
       if (atom.altLoc === "" || atom.altLoc === "A") atoms.push(atom);
     }
-    // REMARK 350 BIOMT records for biological assembly
-    else if (rec === "REMARK" && line.slice(11, 18).trim() === "BIOMT1") {
-      curOp = { matrix: [[0,0,0],[0,0,0],[0,0,0]], trans: [0,0,0] };
-    }
-    if (rec === "REMARK" && /BIOMT[123]/.test(line.slice(11, 20))) {
-      const which = parseInt(line.slice(18, 19)) - 1; // row 0..2
-      const nums = line.slice(23).trim().split(/\s+/).map(Number);
-      // nums = [opNo, m1, m2, m3, t]
-      if (nums.length >= 5 && which >= 0 && which <= 2) {
-        if (which === 0 && !curOp) curOp = { matrix: [[0,0,0],[0,0,0],[0,0,0]], trans: [0,0,0] };
+    // REMARK 350: biological assembly (BIOMOLECULE / APPLY ... CHAINS / BIOMTn)
+    else if (line.startsWith("REMARK 350")) {
+      const body = line.slice(10);
+      const bm = body.match(/BIOMOLECULE:\s*(\d+)/);
+      if (bm) { mol = parseInt(bm[1]); applyChains = null; continue; }
+      if (mol !== null && mol !== 1) continue;
+      const ap = body.match(/(APPLY THE FOLLOWING TO CHAINS|AND CHAINS):(.*)/);
+      if (ap) {
+        const list = ap[2].split(",").map(c => c.trim()).filter(Boolean);
+        applyChains = ap[1] === "AND CHAINS" && applyChains ? applyChains.concat(list) : list;
+        continue;
+      }
+      // "REMARK 350   BIOMT1   1  1.000000  0.000000  0.000000        0.00000"
+      const bt = body.match(/BIOMT([123])\s+\d+\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)/);
+      if (bt) {
+        const row = parseInt(bt[1]) - 1, nums = bt.slice(2, 6).map(Number);
+        if (row === 0) curOp = { matrix: [[0,0,0],[0,0,0],[0,0,0]], trans: [0,0,0],
+          chains: applyChains && applyChains.length ? new Set(applyChains) : null };
         if (curOp) {
-          curOp.matrix[which] = [nums[1], nums[2], nums[3]];
-          curOp.trans[which] = nums[4];
-          if (which === 2) { biomt.push(curOp); curOp = null; }
+          curOp.matrix[row] = nums.slice(0, 3);
+          curOp.trans[row] = nums[3];
+          if (row === 2) { biomt.push(curOp); curOp = null; }
         }
       }
     }
@@ -365,6 +386,7 @@ function applyBiomt(atoms, biomt) {
   biomt.forEach((op, oi) => {
     const [r0, r1, r2] = op.matrix, t = op.trans;
     for (const a of atoms) {
+      if (op.chains && !op.chains.has(a.chain)) continue;
       out.push({
         ...a, opId: oi, baseChain: a.chain,
         x: r0[0]*a.x + r0[1]*a.y + r0[2]*a.z + t[0],
@@ -487,23 +509,33 @@ function clusterChainsBySequence(seqs) {
   return cluster;
 }
 
-// classify the structural scope of a contact between two atoms:
-//  intra        — same chain copy (same baseChain + same opId)
-//  inter_chain  — different base chains (e.g. A↔B), same or any operator
+// classify the structural scope of a contact between two atoms.
+// ctx = {cluster: Map(baseChain -> sequence cluster id), groups: Map(chain -> group id)|null}
+//  intra          — same chain copy (same baseChain + same opId)
 //  inter_protomer — same base chain, different symmetry operator (A↔A_1)
-function contactScope(a, b) {
-  const sameBase = a.baseChain === b.baseChain;
+//  intra_protomer — different chains in the same manual protomer group (same operator)
+//  homotypic      — different chains, identical sequence
+//  heterotypic    — different chains, different sequence (or no sequence, e.g. a ligand-only chain)
+function contactScope(a, b, ctx) {
   const sameOp = (a.opId ?? 0) === (b.opId ?? 0);
-  if (sameBase && sameOp) return "intra";
-  if (!sameBase) return "inter_chain";
-  return "inter_protomer"; // same base chain, different operator
+  if (a.baseChain === b.baseChain) return sameOp ? "intra" : "inter_protomer";
+  const groups = ctx && ctx.groups;
+  if (groups && sameOp && groups.has(a.baseChain) &&
+      groups.get(a.baseChain) === groups.get(b.baseChain)) return "intra_protomer";
+  const cluster = ctx && ctx.cluster;
+  const ca = cluster ? cluster.get(a.baseChain) : undefined;
+  const cb = cluster ? cluster.get(b.baseChain) : undefined;
+  return (ca !== undefined && ca === cb) ? "homotypic" : "heterotypic";
 }
 
 // ---------- bond / interaction classification ----------
+const isHydrogen = el => el === "H" || el === "D";
 function isCovalent(elA, elB, d) {
-  if (elA === "S" && elB === "S") return d <= 2.4;   // disulfide ~2.05 Å
+  if (elA === "S" && elB === "S") return d <= 2.4;    // disulfide ~2.05 Å
+  if (isHydrogen(elA) || isHydrogen(elB)) return d <= 1.3; // X–H ~1.0 Å; H···acceptor (~1.8–2.0) is not a bond
   return d <= 1.95;                                   // generic covalent ceiling
 }
+const COVALENT_SEARCH = 2.4; // longest covalent distance above (S–S)
 
 // vector helpers
 function vsub(a,b){ return [a.x-b.x, a.y-b.y, a.z-b.z]; }
@@ -566,19 +598,30 @@ function isCharged(resName, atomName, sign) {
 // hydrophobic carbons: side-chain C not adjacent to polar groups (approx: any C in hydrophobic residue, or any side-chain C)
 const HYDROPHOBIC_RES = new Set(["ALA","VAL","LEU","ILE","MET","PHE","TRP","PRO","CYS"]);
 
-// is this atom pair the backbone peptide bond? (C of one residue — N of the next)
-// In CA-only selections, fall back to CA(i)–CA(i+1) adjacency (~3.8 Å).
+// is this atom pair the backbone peptide bond? C of one residue bonded (≤1.95 Å)
+// to N of another — geometric, so a C/N pair that is merely within the contact
+// cutoff (e.g. across a β-sheet) is not a peptide bond.
+// caOnly: CA-only selections fall back to CA(i)–CA(i+1) adjacency (~3.8 Å).
 // Never applies to HETATM (ligands like lipids can have C/N atoms that would
 // otherwise be mistaken for a backbone linkage).
-function isPeptideBond(a, b) {
+function isPeptideBond(a, b, d, caOnly) {
   if (a.hetatm || b.hetatm) return false;
   if (a.chain !== b.chain) return false;
-  if (a.resSeq === b.resSeq) return false;
+  if (a.resSeq === b.resSeq && (a.iCode||"") === (b.iCode||"")) return false;
   // true backbone C–N linkage
-  if ((a.name==="C" && b.name==="N") || (a.name==="N" && b.name==="C")) return true;
+  if ((a.name==="C" && b.name==="N") || (a.name==="N" && b.name==="C")) return d <= 1.95;
   // CA-only fallback: consecutive residues within virtual-bond distance
-  if (a.name==="CA" && b.name==="CA" && Math.abs(a.resSeq - b.resSeq) === 1) return true;
+  if (caOnly && a.name==="CA" && b.name==="CA" && Math.abs(a.resSeq - b.resSeq) === 1) return d <= 4.2;
   return false;
+}
+
+// classify one atom pair: {type, bond}. Bonds first (peptide > disulfide/covalent),
+// then non-covalent contacts via classifyInteraction. Always returns a defined type.
+function classifyPair(a, b, d, atoms, geom, ia, ib, caOnly) {
+  if (isPeptideBond(a, b, d, caOnly)) return {type: "peptide", bond: true};
+  if (isCovalent(a.element, b.element, d))
+    return {type: (a.element === "S" && b.element === "S") ? "disulfide" : "covalent", bond: true};
+  return {type: classifyInteraction(a, b, d, atoms, geom, ia, ib), bond: false};
 }
 
 // classify a single atom pair interaction; returns a type string
@@ -653,14 +696,27 @@ function scopeIncluded(scope, opts) {
 }
 
 // ---------- build graph ----------
+// residue identity: chain|resSeq|iCode|resName|copyId. The single key format for
+// residue nodes, node.atomKey, resAtomIndex and the 3D inset — never inline it.
+function residueKey(a) {
+  return `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
+}
+
+// consecutive polymer residues (i, i±1) of the same chain copy
+function isSeqNeighbor(a, b) {
+  return !a.hetatm && !b.hetatm && a.chain === b.chain && Math.abs(a.resSeq - b.resSeq) <= 1;
+}
+
 function buildGraph(atoms, opts) {
-  const effCutoff = opts.covalentOnly ? 1.9 : opts.cutoff;
+  // covalent-only searches just far enough to catch S–S, then keeps bonds only
+  const effCutoff = opts.covalentOnly ? COVALENT_SEARCH : opts.cutoff;
   const sel = selectAtoms(atoms, opts);
   const pairs = buildContacts(sel, effCutoff);
+  const caOnly = opts.atomScope === "ca";
 
   // bonded-atom maps for H-bond angle geometry
   // (skip if covalent-only or CA mode — no meaningful geometry there)
-  const needGeom = !opts.covalentOnly && opts.atomScope !== "ca";
+  const needGeom = !opts.covalentOnly && !caOnly;
   const geom = needGeom ? buildAntecedents(sel) : {ante: sel.map(()=>[]), hydro: sel.map(()=>[])};
 
   // scope context: sequence clusters + optional manual protomer groups
@@ -669,141 +725,154 @@ function buildGraph(atoms, opts) {
   const ctx = { cluster, groups: opts.protomerGroups || null };
 
   // SASA needed? compute per-atom on heavy atoms, then map back onto sel
-  let atomSASA = null;
   const needSASA = opts.colorBy === "sasa" || opts.sizeBy === "sasa";
+  let atomSASA = null;
   if (needSASA) {
-    const heavy = sel.filter(a => a.element !== "H" && a.element !== "D");
+    const heavy = sel.filter(a => !isHydrogen(a.element));
     const s = computeSASA(heavy);
     atomSASA = new Map();
     heavy.forEach((a,i)=> atomSASA.set(a, s[i]));
   }
 
+  // classify every atom pair once; drop pairs whose scope is switched off
+  const contacts = [];
+  for (const [i,j,d] of pairs) {
+    const a = sel[i], b = sel[j];
+    const scope = contactScope(a, b, ctx);
+    if (!scopeIncluded(scope, opts)) continue;
+    const {type, bond} = classifyPair(a, b, d, sel, geom, i, j, caOnly);
+    if (opts.covalentOnly && !bond) continue;
+    contacts.push({i, j, d, scope, type, bond});
+  }
+
+  let nodes, links;
   if (opts.granularity === "atom") {
-    const nodes = sel.map((a,i) => ({
+    nodes = sel.map((a,i) => ({
       id: i, label: a.name,
-      group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId, copyId: a.copyId,
+      group: a.chain, chain: a.chain, baseChain: a.baseChain, opId: a.opId, copyId: a.copyId ?? 0,
       hetatm: a.hetatm,
       resName: a.resName, resSeq: a.resSeq, iCode: a.iCode, atomRef: a,
+      atomKey: residueKey(a),
       hydro: KD[a.resName] ?? null,
       vol: VOL[a.resName] ?? null,
       sasa: atomSASA ? (atomSASA.get(a) ?? 0) : null,
       relsasa: null,
       resclass: RESCLASS[a.resName] || "unknown",
-      title: `${a.chain} ${a.resName}${a.resSeq} ${a.name}`
+      title: `${a.chain} ${a.resName}${a.resSeq}${a.iCode||""} ${a.name}`
     }));
-    const links = pairs.filter(([i,j]) => {
-      const scope = contactScope(sel[i], sel[j], ctx);
-      return scopeIncluded(scope, opts);
-    }).map(([i,j,d]) => {
-      const a = sel[i], b = sel[j];
-      const scope = contactScope(a, b, ctx) || "heterotypic";
-      const peptide = isPeptideBond(a, b);
-      const covalent = isCovalent(a.element, b.element, d) || peptide;
-      let type;
-      if (peptide) type = "peptide";
-      else if (isCovalent(a.element, b.element, d))
-        type = (a.element==="S" && b.element==="S") ? "disulfide" : "covalent";
-      else type = classifyInteraction(a, b, d, sel, geom, i, j);
-      return {source:i, target:j, dist:d, scope,
-        inter: scope !== "intra", bond: covalent, type: type || "vdw"};
+    links = contacts.map(c => ({source:c.i, target:c.j, dist:c.d,
+      type:c.type, scope:c.scope, inter:c.scope !== "intra", bond:c.bond}));
+  } else {
+    // residue-level: collapse atom pairs to residue-residue edges
+    const resMap = new Map();
+    sel.forEach(a => {
+      const k = residueKey(a);
+      if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, baseChain:a.baseChain,
+        opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, copyId:a.copyId??0,
+        hetatm:a.hetatm, sasa:0});
+      if (atomSASA && atomSASA.has(a)) resMap.get(k).sasa += atomSASA.get(a);
     });
-    sceneAtoms = sel;
-    resAtomIndex = new Map();
-    for (const a of sel) {
-      const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
-      if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
-      resAtomIndex.get(k).push(a);
+    const resList = [...resMap.values()];
+    const resIndex = new Map(resList.map((r,i)=>[r.key,i]));
+
+    // strongest interaction and most notable scope label each aggregated edge
+    const edgeAgg = new Map(); // "lo-hi" -> edge
+    for (const c of contacts) {
+      const ri = resIndex.get(residueKey(sel[c.i])), rj = resIndex.get(residueKey(sel[c.j]));
+      if (ri === rj) continue;
+      if (opts.excludeSeqAdj && isSeqNeighbor(resList[ri], resList[rj])) continue;
+      const lo = Math.min(ri,rj), hi = Math.max(ri,rj), ek = lo+"-"+hi;
+      let e = edgeAgg.get(ek);
+      if (!e) edgeAgg.set(ek, e = {source:lo, target:hi, dist:Infinity, count:0,
+        type:null, scope:null, inter:false, bond:false});
+      e.count++;
+      e.dist = Math.min(e.dist, c.d);
+      e.type = strongerInteraction(e.type, c.type);
+      e.scope = mergeScoperank(e.scope, c.scope);
+      e.inter = e.scope !== "intra";
+      e.bond = e.bond || c.bond;
     }
-    nodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq}|${n.iCode||""}|${n.resName}|${n.copyId??0}`; });
-    return {nodes, links, meta:{seqs, cluster}};
+    const edges = [...edgeAgg.values()];
+
+    // keep only residues that have at least one edge, renumbered 0..n-1
+    const used = new Set();
+    edges.forEach(e => { used.add(e.source); used.add(e.target); });
+    const remap = new Map();
+    nodes = [];
+    resList.forEach((r,i) => {
+      if (!used.has(i)) return;
+      remap.set(i, nodes.length);
+      nodes.push({
+        id:nodes.length, label:`${r.resName}${r.resSeq}`, group:r.chain, chain:r.chain,
+        baseChain:r.baseChain, opId:r.opId, copyId:r.copyId, hetatm:r.hetatm,
+        resName:r.resName, resSeq:r.resSeq, iCode:r.iCode,
+        atomKey: r.key,
+        hydro: KD[r.resName] ?? null,
+        vol: VOL[r.resName] ?? null,
+        sasa: needSASA ? r.sasa : null,
+        relsasa: needSASA && MAXASA[r.resName] ? Math.min(r.sasa/MAXASA[r.resName],1) : null,
+        resclass: RESCLASS[r.resName] || "unknown",
+        title:`${r.chain} ${r.resName} ${r.resSeq}${r.iCode||""}`
+      });
+    });
+    links = edges.map(e => ({...e, source:remap.get(e.source), target:remap.get(e.target)}));
   }
 
-  // residue-level: collapse pairs to residue-residue
-  const resKey = a => `${a.chain}|${a.resSeq}|${a.iCode}|${a.resName}|${a.copyId??0}`;
-  const resMap = new Map();
-  sel.forEach(a => {
-    const k = resKey(a);
-    if (!resMap.has(k)) resMap.set(k, {key:k, chain:a.chain, baseChain:a.baseChain,
-      opId:a.opId, resSeq:a.resSeq, resName:a.resName, iCode:a.iCode, copyId:a.copyId??0,
-      hetatm:a.hetatm, sasa:0});
-    if (atomSASA && atomSASA.has(a)) resMap.get(k).sasa += atomSASA.get(a);
-  });
-  const resList = [...resMap.values()];
-  const resIndex = new Map(resList.map((r,i)=>[r.key,i]));
-
-  const edgeAgg = new Map(); // "i-j" -> {count, minDist}
-  for (const [i,j,d] of pairs) {
-    const ri = resIndex.get(resKey(sel[i])), rj = resIndex.get(resKey(sel[j]));
-    if (ri === rj) continue;
-    const a = resList[ri], b = resList[rj];
-    const sameChain = a.chain === b.chain;
-    if (sameChain && !opts.intraChain) continue;
-    if (!sameChain && !opts.interChain) continue;
-    if (opts.excludeSeqAdj && sameChain && Math.abs(a.resSeq - b.resSeq) <= 1) continue;
-    const lo = Math.min(ri,rj), hi = Math.max(ri,rj), ek = lo+"-"+hi;
-    if (!edgeAgg.has(ek)) edgeAgg.set(ek, {source:lo, target:hi, count:0, dist:Infinity,
-      inter: !sameChain, bond:false});
-    const e = edgeAgg.get(ek); e.count++; e.dist = Math.min(e.dist, d);
-    if (isCovalent(sel[i].element, sel[j].element, d)) e.bond = true;
-  }
-
-  const nodes = resList.map((r,i)=>({
-    id:i, label:`${r.resName}${r.resSeq}`, group:r.chain, chain:r.chain,
-    baseChain:r.baseChain, opId:r.opId, copyId:r.copyId, hetatm:r.hetatm,
-    resName:r.resName, resSeq:r.resSeq, iCode:r.iCode,
-    hydro: KD[r.resName] ?? null,
-    vol: VOL[r.resName] ?? null,
-    sasa: needSASA ? r.sasa : null,
-    relsasa: needSASA && MAXASA[r.resName] ? Math.min(r.sasa/MAXASA[r.resName],1) : null,
-    resclass: RESCLASS[r.resName] || "unknown",
-    title:`${r.chain} ${r.resName} ${r.resSeq}${r.iCode}`
-  }));
-  const links = [...edgeAgg.values()];
-  // drop isolated nodes
-  const used = new Set();
-  links.forEach(l => { used.add(l.source); used.add(l.target); });
-  const remap = new Map(); let n=0;
-  const fnodes = nodes.filter(nd => used.has(nd.id)).map(nd => { remap.set(nd.id, n); return {...nd, id:n++}; });
-  const flinks = links.map(l => ({...l, source:remap.get(l.source), target:remap.get(l.target),
-    type: l.type || "vdw", scope: l.scope || "heterotypic"}));
-
-  // index atoms per residue node for the 3D inset
+  // index the selected atoms per residue for the 3D inset
   sceneAtoms = sel;
   resAtomIndex = new Map();
   for (const a of sel) {
-    const k = `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
+    const k = residueKey(a);
     if (!resAtomIndex.has(k)) resAtomIndex.set(k, []);
     resAtomIndex.get(k).push(a);
   }
-  fnodes.forEach(n => { n.atomKey = `${n.chain}|${n.resSeq||""}|${n.iCode||""}|${n.resName}|${n.copyId??0}`; });
 
-  return {nodes:fnodes, links:flinks, meta:{seqs, cluster}};
+  return {nodes, links, meta:{seqs, cluster}};
 }
 
 // ---------- rendering ----------
 let sim = null;
 const idOf = x => (x && typeof x === "object") ? x.id : x;
+
+// edge colors / labels, shared by links, tooltip and legend
+const EDGE_COLORS = {
+  peptide:"#22d3ee", disulfide:"#eab308", covalent:"#67e8f9",
+  salt_bridge:"#ef4444", hydrogen_bond:"#3b82f6",
+  hydrophobic:"#f59e0b", vdw:"#4b5563"
+};
+const EDGE_LABELS = {peptide:"peptide bond", disulfide:"disulfide",
+  covalent:"other covalent", salt_bridge:"salt bridge",
+  hydrogen_bond:"hydrogen bond", hydrophobic:"hydrophobic", vdw:"van der Waals"};
+const SCOPE_COLORS = { intra:"#4b5563", intra_protomer:"#14b8a6",
+  homotypic:"#f59e0b", heterotypic:"#ec4899", inter_protomer:"#a855f7" };
+const SCOPE_LABELS = {intra:"intra-chain", intra_protomer:"intra-protomer",
+  homotypic:"homotypic (A↔B, same seq)", heterotypic:"heterotypic (A↔B, diff seq)",
+  inter_protomer:"inter-protomer (A↔A′)"};
+const FALLBACK_COLOR = "#4b5563";
+// position in a priority list; unknown values sort last
+const rankIn = (list, v) => { const i = list.indexOf(v); return i === -1 ? list.length : i; };
+
+// "Show edges" filter
+function filterLinks(links, ef) {
+  if (ef === "all") return links;
+  if (ef === "bonds") return links.filter(l => l.bond);
+  if (ef === "contacts") return links.filter(l => !l.bond);
+  if (ef.startsWith("scope_")) { const sc = ef.slice(6); return links.filter(l => l.scope === sc); }
+  return links.filter(l => l.type === ef);
+}
+
 function render(g, opts) {
   const svg = d3.select("#graph");
+  if (sim) sim.stop();           // the old simulation would keep moving the same nodes
   svg.selectAll("*").remove();
   // a re-render invalidates any prior selection styling
   if (selectedNodeId !== null) { selectedNodeId = null; $("inset").style.display = "none"; }
   const W = svg.node().clientWidth, H = svg.node().clientHeight;
+  const tip = $("tooltip");
 
-  // edge type filter
-  const BOND_TYPES = new Set(["peptide","disulfide","covalent"]);
-  let shownLinks = g.links;
-  const ef = opts.edgeFilter;
-  if (ef === "bonds") shownLinks = g.links.filter(l => l.bond);
-  else if (ef === "contacts") shownLinks = g.links.filter(l => !l.bond);
-  else if (ef === "scope_intra") shownLinks = g.links.filter(l => l.scope === "intra");
-  else if (ef === "scope_intra_protomer") shownLinks = g.links.filter(l => l.scope === "intra_protomer");
-  else if (ef === "scope_homotypic") shownLinks = g.links.filter(l => l.scope === "homotypic");
-  else if (ef === "scope_heterotypic") shownLinks = g.links.filter(l => l.scope === "heterotypic");
-  else if (ef === "scope_inter_protomer") shownLinks = g.links.filter(l => l.scope === "inter_protomer");
-  else if (ef !== "all") shownLinks = g.links.filter(l => l.type === ef);
+  const shownLinks = filterLinks(g.links, opts.edgeFilter);
 
-  // compute degree (from shown links)
+  // degree from shown links (node ids are 0..n-1)
   const deg = new Array(g.nodes.length).fill(0);
   shownLinks.forEach(l => { deg[idOf(l.source)]++; deg[idOf(l.target)]++; });
   g.nodes.forEach((n,i)=> n.degree = deg[i]);
@@ -811,18 +880,18 @@ function render(g, opts) {
   const chains = [...new Set(g.nodes.map(n=>n.chain))];
   const chainColor = d3.scaleOrdinal(d3.schemeTableau10).domain(chains);
 
-  // ----- color scale -----
+  // ----- node color -----
   let colorFn, legendItems, legendTitle;
   const cb = opts.colorBy;
   if (cb === "hydrophobicity") {
     const sc = d3.scaleSequential(d3.interpolateRdYlBu).domain([4.5,-4.5]); // red=hydrophobic
-    colorFn = n => n.hydro==null ? "#6b7280" : sc(n.hydro);
+    colorFn = n => n.hydro==null ? CLASSCOLOR.unknown : sc(n.hydro);
     legendTitle = "Hydrophobicity";
     legendItems = [["#a50026","hydrophobic (+4.5)"],["#ffffbf","neutral (0)"],["#313695","hydrophilic (−4.5)"]];
+    if (g.nodes.some(n => n.hydro == null)) legendItems.push([CLASSCOLOR.unknown, "no value"]);
   } else if (cb === "sasa") {
-    const vals = g.nodes.map(n=>n.relsasa ?? n.sasa ?? 0);
-    const mx = d3.max(vals)||1;
     const useRel = g.nodes.some(n=>n.relsasa!=null);
+    const mx = d3.max(g.nodes, n => n.sasa ?? 0) || 1;
     const sc = d3.scaleSequential(d3.interpolateViridis).domain([0, useRel?1:mx]);
     colorFn = n => sc(useRel ? (n.relsasa??0) : (n.sasa??0));
     legendTitle = "Surface accessibility";
@@ -830,8 +899,10 @@ function render(g, opts) {
   } else if (cb === "restype") {
     colorFn = n => CLASSCOLOR[n.resclass] || CLASSCOLOR.unknown;
     legendTitle = "Residue type";
-    legendItems = [["#ef4444","acidic (−)"],["#3b82f6","basic (+)"],["#10b981","polar"],
-      ["#f59e0b","hydrophobic"],["#a855f7","Gly/Pro"]];
+    legendItems = [[CLASSCOLOR.neg,"acidic (−)"],[CLASSCOLOR.pos,"basic (+)"],[CLASSCOLOR.polar,"polar"],
+      [CLASSCOLOR.hydrophobic,"hydrophobic"],[CLASSCOLOR.special,"Gly/Pro"]];
+    if (g.nodes.some(n => !CLASSCOLOR[n.resclass] || n.resclass === "unknown"))
+      legendItems.push([CLASSCOLOR.unknown, "other"]);
   } else if (cb === "degree") {
     const mx = d3.max(deg)||1;
     const sc = d3.scaleSequential(d3.interpolateYlOrRd).domain([0,mx]);
@@ -844,18 +915,18 @@ function render(g, opts) {
     legendItems = chains.map(c=>[chainColor(c),"chain "+c]);
   }
 
-  // ----- size scale -----
+  // ----- node size -----
   let sizeFn;
   const sb = opts.sizeBy, baseR = g.nodes.length > 400 ? 4 : 6;
   if (sb === "size") {
     const sc = d3.scaleSqrt().domain([60,228]).range([3,12]);
     sizeFn = n => n.vol==null ? baseR : sc(n.vol);
   } else if (sb === "sasa") {
-    const vals = g.nodes.map(n=>n.sasa??0); const mx=d3.max(vals)||1;
+    const mx = d3.max(g.nodes, n => n.sasa ?? 0) || 1;
     const sc = d3.scaleSqrt().domain([0,mx]).range([3,13]);
     sizeFn = n => sc(n.sasa??0);
   } else if (sb === "degree") {
-    const mx=d3.max(deg)||1;
+    const mx = d3.max(deg)||1;
     const sc = d3.scaleSqrt().domain([0,mx]).range([3,14]);
     sizeFn = n => sc(n.degree);
   } else {
@@ -863,22 +934,17 @@ function render(g, opts) {
   }
   g.nodes.forEach(n => n.r = sizeFn(n));
 
-  const zoomG = svg.append("g");
-  svg.call(d3.zoom().scaleExtent([0.1, 8]).on("zoom", e => zoomG.attr("transform", e.transform)));
-
-  // interaction-type colors
-  const EDGE_COLORS = {
-    peptide:"#22d3ee", disulfide:"#eab308", covalent:"#67e8f9",
-    salt_bridge:"#ef4444", hydrogen_bond:"#3b82f6",
-    hydrophobic:"#f59e0b", vdw:"#4b5563"
-  };
-  const SCOPE_COLORS = { intra:"#4b5563", intra_protomer:"#14b8a6",
-    homotypic:"#f59e0b", heterotypic:"#ec4899", inter_protomer:"#a855f7" };
+  // ----- edge color -----
   const edgeColor = d => {
-    if (opts.edgeColorBy === "chain") return d.inter ? "#f59e0b" : "#4b5563";
-    if (opts.edgeColorBy === "scope") return SCOPE_COLORS[d.scope] || "#4b5563";
-    return EDGE_COLORS[d.type] || "#4b5563";
+    if (opts.edgeColorBy === "chain") return d.inter ? "#f59e0b" : FALLBACK_COLOR;
+    if (opts.edgeColorBy === "scope") return SCOPE_COLORS[d.scope] || FALLBACK_COLOR;
+    return EDGE_COLORS[d.type] || FALLBACK_COLOR;
   };
+
+  // ----- drawing -----
+  const zoomG = svg.append("g");
+  const zoom = d3.zoom().scaleExtent([0.1, 8]).on("zoom", e => zoomG.attr("transform", e.transform));
+  svg.call(zoom).call(zoom.transform, d3.zoomIdentity); // new <g> starts untransformed; keep zoom state in sync
 
   const link = zoomG.append("g").selectAll("line").data(shownLinks).enter().append("line")
     .attr("class","link")
@@ -887,47 +953,49 @@ function render(g, opts) {
     .attr("stroke-dasharray", d => d.bond ? "none" : "3,2")
     .attr("stroke-opacity", d => d.bond ? 0.95 : 0.55);
 
-  const tip = $("tooltip");
   link.on("mousemove", (e,d) => {
     tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
-    const s = g.nodes[idOf(d.source)] || d.source, t = g.nodes[idOf(d.target)] || d.target;
+    const s = g.nodes[idOf(d.source)], t = g.nodes[idOf(d.target)];
     const scopeLabel = {intra:"intra-chain", intra_protomer:"intra-protomer",
       homotypic:"homotypic", heterotypic:"heterotypic",
       inter_protomer:"inter-protomer"}[d.scope] || d.scope || "unclassified";
-    tip.innerHTML = `<b>${(EDGE_LABELS[d.type]||d.type)}</b> · ${scopeLabel}<br>`
+    tip.innerHTML = `<b>${EDGE_LABELS[d.type] || d.type || "unclassified"}</b> · ${scopeLabel}<br>`
       + `${s.title||s.label} — ${t.title||t.label}<br>`
       + `min dist ${d.dist.toFixed(2)} Å`
-      + (d.count ? ` · ${d.count} atom pairs` : "");
+      + (d.count ? ` · ${d.count} atom pair${d.count === 1 ? "" : "s"}` : "");
   }).on("mouseout", () => tip.style.opacity = 0);
 
   const node = zoomG.append("g").selectAll("g").data(g.nodes).enter().append("g")
     .attr("class","node").call(drag());
 
-  // polymer residues → circles; HETATM (ligands/ions/water) → squares
-  const polymerNodes = node.filter(d => !d.hetatm);
-  const hetNodes = node.filter(d => d.hetatm);
-  polymerNodes.append("circle").attr("r", d=>d.r).attr("fill", colorFn)
+  // polymer residues → circles; HETATM (ligands/ions/water) → squares.
+  // highlightSelection/clearHighlight style both via ".node circle, .node rect".
+  node.filter(d => !d.hetatm).append("circle")
+    .attr("r", d=>d.r)
+    .attr("fill", colorFn)
+    .attr("stroke", "#0f1115").attr("stroke-width", 1.5)
     .style("cursor", "pointer");
-  hetNodes.append("rect")
+  node.filter(d => d.hetatm).append("rect")
     .attr("x", d=>-d.r).attr("y", d=>-d.r)
     .attr("width", d=>d.r*2).attr("height", d=>d.r*2)
     .attr("rx", 1.5)
     .attr("fill", colorFn)
     .attr("stroke", "#e6e8eb").attr("stroke-width", 1)
     .style("cursor", "pointer");
-  node.on("click", (e,d) => { e.stopPropagation(); selectNode(d); highlightSelection(d.id); });
+  // both shapes are centred on the node with half-width r, so one label offset fits
   if (g.nodes.length <= 300)
     node.append("text").attr("dx", d=>d.r+2).attr("dy", 3).text(d => d.label);
 
-  node.on("mousemove", (e,d) => {
-    tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
-    let extra = `chain ${d.chain} · degree ${d.degree}`;
-    if (d.hydro!=null) extra += `<br>hydropathy ${d.hydro}`;
-    if (d.vol!=null) extra += ` · vol ${d.vol} Å³`;
-    if (d.sasa!=null) extra += `<br>SASA ${d.sasa.toFixed(1)} Å²`
-      + (d.relsasa!=null ? ` (${(d.relsasa*100).toFixed(0)}% exp.)` : "");
-    tip.innerHTML = `<b>${d.title}</b><br>${extra}`;
-  }).on("mouseout", () => tip.style.opacity = 0);
+  node.on("click", (e,d) => { e.stopPropagation(); selectNode(d); highlightSelection(d.id); })
+    .on("mousemove", (e,d) => {
+      tip.style.opacity = 1; tip.style.left = (e.offsetX+14)+"px"; tip.style.top = (e.offsetY+14)+"px";
+      let extra = `chain ${d.chain} · degree ${d.degree}`;
+      if (d.hydro!=null) extra += `<br>hydropathy ${d.hydro}`;
+      if (d.vol!=null) extra += ` · vol ${d.vol} Å³`;
+      if (d.sasa!=null) extra += `<br>SASA ${d.sasa.toFixed(1)} Å²`
+        + (d.relsasa!=null ? ` (${(d.relsasa*100).toFixed(0)}% exp.)` : "");
+      tip.innerHTML = `<b>${d.title}</b><br>${extra}`;
+    }).on("mouseout", () => tip.style.opacity = 0);
 
   sim = d3.forceSimulation(g.nodes)
     .force("link", d3.forceLink(shownLinks).id(d=>d.id).distance(30).strength(0.4))
@@ -940,38 +1008,30 @@ function render(g, opts) {
       node.attr("transform", d=>`translate(${d.x},${d.y})`);
     });
 
-  // legend
-  const EDGE_LABELS = {peptide:"peptide bond", disulfide:"disulfide",
-    covalent:"other covalent", salt_bridge:"salt bridge",
-    hydrogen_bond:"hydrogen bond", hydrophobic:"hydrophobic", vdw:"van der Waals"};
-  const lg = $("legend"); lg.style.display="block";
+  // ----- legend -----
+  const swatch = (color, text, style="") =>
+    `<div><span class="swatch" style="background:${color};${style}"></span>${text}</div>`;
   let edgeLegend;
   if (opts.edgeColorBy === "chain") {
-    edgeLegend = `<div><span class="swatch" style="background:#4b5563"></span>intra-chain</div>`
-      + `<div><span class="swatch" style="background:#f59e0b"></span>inter (any)</div>`;
+    edgeLegend = swatch(FALLBACK_COLOR, "intra-chain") + swatch("#f59e0b", "inter (any)");
   } else if (opts.edgeColorBy === "scope") {
-    const present = [...new Set(shownLinks.map(l=>l.scope))]
-      .sort((a,b)=>SCOPE_RANK.indexOf(a)-SCOPE_RANK.indexOf(b));
-    const SCOPE_LABELS = {intra:"intra-chain", intra_protomer:"intra-protomer",
-      homotypic:"homotypic (A↔B, same seq)", heterotypic:"heterotypic (A↔B, diff seq)",
-      inter_protomer:"inter-protomer (A↔A′)"};
-    edgeLegend = present.map(s =>
-      `<div><span class="swatch" style="background:${SCOPE_COLORS[s]||"#4b5563"}"></span>${SCOPE_LABELS[s]||s||"unclassified"}</div>`).join("");
+    edgeLegend = [...new Set(shownLinks.map(l=>l.scope).filter(v => v != null))]
+      .sort((a,b)=>rankIn(SCOPE_RANK,a)-rankIn(SCOPE_RANK,b))
+      .map(sc => swatch(SCOPE_COLORS[sc] || FALLBACK_COLOR, SCOPE_LABELS[sc] || sc)).join("");
   } else {
-    const present = [...new Set(shownLinks.map(l=>l.type).filter(t => t != null))]
-      .sort((a,b)=>INTERACTION_PRIORITY.indexOf(a)-INTERACTION_PRIORITY.indexOf(b));
-    edgeLegend = present.map(t =>
-      `<div><span class="swatch" style="background:${EDGE_COLORS[t]||"#4b5563"}"></span>${EDGE_LABELS[t]||t}</div>`).join("");
-    if (!edgeLegend) edgeLegend = `<div style="color:#6b7280">no edges shown</div>`;
+    edgeLegend = [...new Set(shownLinks.map(l=>l.type).filter(v => v != null))]
+      .sort((a,b)=>rankIn(INTERACTION_PRIORITY,a)-rankIn(INTERACTION_PRIORITY,b))
+      .map(t => swatch(EDGE_COLORS[t] || FALLBACK_COLOR, EDGE_LABELS[t] || t)).join("");
   }
-  const hasHet = g.nodes.some(n => n.hetatm);
-  const shapeKey = hasHet
+  if (!edgeLegend) edgeLegend = `<div style="color:#6b7280">no edges shown</div>`;
+  const shapeKey = g.nodes.some(n => n.hetatm)
     ? `<div style="font-weight:600;margin:6px 0 4px">Nodes</div>`
-      + `<div><span class="swatch" style="background:#8b93a1;border-radius:50%"></span>residue (circle)</div>`
-      + `<div><span class="swatch" style="background:#8b93a1;border:1px solid #e6e8eb"></span>HETATM (square)</div>`
+      + swatch("#8b93a1", "residue (circle)", "border-radius:50%")
+      + swatch("#8b93a1", "HETATM (square)", "border:1px solid #e6e8eb")
     : "";
+  const lg = $("legend"); lg.style.display = "block";
   lg.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${legendTitle}</div>`
-    + legendItems.map(([c,t])=>`<div><span class="swatch" style="background:${c}"></span>${t}</div>`).join("")
+    + legendItems.map(([c,t]) => swatch(c, t)).join("")
     + shapeKey
     + `<div style="font-weight:600;margin:6px 0 4px">Edges</div>` + edgeLegend;
 }
@@ -1084,12 +1144,10 @@ const inset3d = (() => {
     pos.forEach(p=> maxR = Math.max(maxR, p.length()));
     dist = maxR*2.6 + 4;
 
-    const resKeyOf = a => `${a.chain}|${a.resSeq}|${a.iCode||""}|${a.resName}|${a.copyId??0}`;
-
     // atoms as spheres
     atoms.forEach((a,i)=>{
-      const hl = highlightKeys.has(resKeyOf(a));
-      const r = (a.element==="H") ? 0.25 : (hl ? 0.42 : 0.32);
+      const hl = highlightKeys.has(residueKey(a));
+      const r = isHydrogen(a.element) ? 0.25 : (hl ? 0.42 : 0.32);
       const geo = new THREE.SphereGeometry(r, 16, 12);
       const mat = new THREE.MeshLambertMaterial({
         color: elemColor(a.element),
@@ -1102,13 +1160,12 @@ const inset3d = (() => {
       group.add(m);
     });
 
-    // bonds as cylinders (covalent distance ≤ ~1.95, S-S ≤ 2.4)
+    // bonds as cylinders (same covalent rule as the network)
     for (let i=0;i<atoms.length;i++) for (let j=i+1;j<atoms.length;j++) {
       const d = pos[i].distanceTo(pos[j]);
-      const ss = atoms[i].element==="S" && atoms[j].element==="S";
-      if (d <= (ss?2.4:1.95) && d > 0.4) {
+      if (d > 0.4 && isCovalent(atoms[i].element, atoms[j].element, d)) {
         addBond(group, pos[i], pos[j],
-          highlightKeys.has(resKeyOf(atoms[i])) || highlightKeys.has(resKeyOf(atoms[j])));
+          highlightKeys.has(residueKey(atoms[i])) || highlightKeys.has(residueKey(atoms[j])));
       }
     }
     scene.add(group);
@@ -1278,7 +1335,7 @@ function loadText(text, name) {
   $("buildBtn").disabled = false;
   const chains = [...new Set(parsed.atoms.filter(a=>!a.hetatm).map(a=>a.chain))];
   $("asmNote").textContent = parsed.biomt.length
-    ? `${parsed.biomt.length} BIOMT operator(s) found.`
+    ? `${parsed.biomt.length} BIOMT operator(s) found (biological assembly 1).`
     : "No BIOMT records; bio-assembly = asym unit.";
   $("stats").innerHTML = `<b>${name}</b> loaded<br>`
     + `${parsed.atoms.length} atoms, ${chains.length} chain(s)<br>`
@@ -1415,7 +1472,7 @@ const README = String.raw`# Pampano
 
 ### Loading & assembly
 - **PDB file / Fetch by ID** — provide the structure either way. Fetch needs an internet connection and a valid RCSB entry.
-- **Assembly** — *Monomer* (first chain only), *Full asymmetric unit* (all chains as deposited), or *Biological assembly* (applies REMARK 350 BIOMT operators to rebuild the multimer; falls back to the asymmetric unit if no BIOMT records exist).
+- **Assembly** — *Monomer* (first chain only), *Full asymmetric unit* (all chains as deposited), or *Biological assembly* (applies the REMARK 350 BIOMT operators of biological assembly 1, each to the chains it lists, to rebuild the multimer; falls back to the asymmetric unit if no BIOMT records exist).
 
 ### Network definition
 - **Granularity** — *Residue-level* (one node per residue; edges aggregate atom-atom contacts, keeping the closest distance and pair count) or *Atom-level* (one node per atom; more detailed, heavier).
@@ -1429,9 +1486,9 @@ const README = String.raw`# Pampano
 - **Color edges by** — interaction type, contact scope, or a simple intra/inter split.
 
 ### Advanced
-- **Covalent bonds only** — build a network of covalent linkages alone (~1.9 Å).
+- **Covalent bonds only** — build a network of covalent linkages alone (≤ 1.95 Å; S–S ≤ 2.4 Å; X–H ≤ 1.3 Å).
 - **Include intra-chain / inter-chain / inter-protomer contacts** — toggle each scope.
-- **Exclude sequential neighbors** — removes contacts between consecutive residues to show only tertiary/quaternary contacts. Off by default.
+- **Exclude sequential neighbors** — removes contacts between consecutive polymer residues (HETATM groups are unaffected) to show only tertiary/quaternary contacts. Off by default.
 - **Protomer groups** — group chains into protomers (e.g. @A,B ; C,D@) to separate within-protomer from between-protomer interfaces. Blank = classify inter-chain contacts automatically by sequence.
 - **Include HETATM** — include ligands, cofactors, ions, and water.
 
@@ -1461,7 +1518,7 @@ Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, io
 From strongest/most-specific to weakest; when several atom-pair interactions contribute to one residue edge, the strongest labels it.
 - **Peptide bond** — covalent backbone linkage between consecutive residues, C(i)–N(i+1). Detected from backbone geometry, not residue numbering.
 - **Disulfide** — covalent S–S bond between two cysteines (~2.05 Å).
-- **Covalent (other)** — any other covalent linkage (≤ ~1.95 Å), e.g. ligand attachments.
+- **Covalent (other)** — any other covalent linkage (≤ ~1.95 Å; ≤ 1.3 Å when a hydrogen is involved), e.g. ligand attachments.
 - **Salt bridge** — oppositely charged groups within 4.0 Å: basic N (Arg, Lys, His) and acidic O (Asp, Glu).
 - **Hydrogen bond** — donor N/O and acceptor N/O within 3.5 Å that also pass an angle check (below).
 - **Hydrophobic** — carbon–carbon contact within 4.0 Å involving a hydrophobic residue.
@@ -1530,14 +1587,5 @@ $("helpClose").addEventListener("click", () => { $("helpModal").style.display = 
 $("helpModal").addEventListener("click", e => { if (e.target.id === "helpModal") $("helpModal").style.display = "none"; });
 document.addEventListener("keydown", e => { if (e.key === "Escape") $("helpModal").style.display = "none"; });
 </script>
-<div id="helpModal" class="modal-backdrop" style="display:none">
-  <div class="modal">
-    <div class="modal-head">
-      <span>Pampano — Help &amp; Glossary</span>
-      <span id="helpClose" class="modal-close" title="Close">×</span>
-    </div>
-    <div class="modal-body" id="helpBody"></div>
-  </div>
-</div>
 </body>
 </html>
