@@ -73,6 +73,34 @@
   #insetClose:hover { color: #e6e8eb; }
   #insetCanvas { width: 280px; height: 220px; background: #0b0d11; cursor: grab; }
   #insetInfo { padding: 8px 12px; font-size: 11px; color: #9aa3b2; line-height: 1.5; }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100;
+    display: flex; align-items: center; justify-content: center; padding: 30px;
+  }
+  .modal {
+    background: #141720; border: 1px solid #2c3340; border-radius: 12px;
+    width: 760px; max-width: 100%; max-height: 90vh; display: flex; flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .modal-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 20px; border-bottom: 1px solid #262b36; font-weight: 600; font-size: 15px;
+  }
+  .modal-close { cursor: pointer; color: #8b93a1; font-size: 22px; line-height: 1; }
+  .modal-close:hover { color: #e6e8eb; }
+  .modal-body { overflow-y: auto; padding: 8px 24px 24px; font-size: 13.5px; line-height: 1.6; color: #cbd2dd; }
+  .modal-body h1 { font-size: 20px; margin: 18px 0 6px; color: #e6e8eb; }
+  .modal-body h2 { font-size: 16px; margin: 22px 0 6px; color: #e6e8eb; border-bottom: 1px solid #262b36; padding-bottom: 4px; }
+  .modal-body h3 { font-size: 14px; margin: 16px 0 4px; color: #dbe0e8; }
+  .modal-body code { background: #0f1115; padding: 1px 5px; border-radius: 4px; font-size: 12px; color: #93c5fd; }
+  .modal-body ul { margin: 6px 0; padding-left: 22px; }
+  .modal-body li { margin: 3px 0; }
+  .modal-body blockquote { border-left: 3px solid #3b82f6; margin: 10px 0; padding: 4px 14px; color: #9aa3b2; background: #11141b; border-radius: 0 6px 6px 0; }
+  .modal-body hr { border: none; border-top: 1px solid #262b36; margin: 18px 0; }
+  .modal-body strong { color: #e6e8eb; }
+  .modal-body em { color: #cbd2dd; }
+  .modal-body p { margin: 8px 0; }
+  .modal-body a { color: #60a5fa; }
   .legend div { display: flex; align-items: center; gap: 6px; margin: 2px 0; }
   .swatch { width: 12px; height: 12px; border-radius: 3px; }
   details { margin-top: 10px; }
@@ -89,7 +117,7 @@
     <span class="fallback">🐟</span>
     <h1>Pampano</h1>
   </div>
-  <div class="sub">Contacts &amp; bonds from structure</div>
+  <div class="sub">Contacts &amp; bonds from structure · <a href="#" id="helpLink" style="color:#60a5fa;text-decoration:none">Help / README</a></div>
 
   <label>PDB file (upload)</label>
   <input type="file" id="fileInput" accept=".pdb,.ent,.txt">
@@ -155,7 +183,7 @@
     <label>Protomer groups (optional)</label>
     <input type="text" id="protomerGroups" placeholder="e.g. A,B ; C,D">
     <div class="note">Group chains into protomers to distinguish within-protomer from between-protomer interfaces. Chains in the same group → "intra-protomer". Leave blank to classify inter-chain contacts automatically by exact sequence (homotypic = same sequence, heterotypic = different).</div>
-    <label><input type="checkbox" id="excludeSeqAdj" checked> Exclude sequential neighbors (residue mode)</label>
+    <label><input type="checkbox" id="excludeSeqAdj"> Exclude sequential neighbors (residue mode)</label>
     <label><input type="checkbox" id="includeHetatm"> Include HETATM (ligands/water)</label>
   </details>
 
@@ -1315,6 +1343,144 @@ $("assemblyMode").addEventListener("change", e => {
   $("asmNote").textContent = e.target.value === "bioassembly" && parsed && !parsed.biomt.length
     ? "No BIOMT records; will use asym unit." : "";
 });
+
+// ---------- Help / README modal ----------
+const README = String.raw`# Pampano
+
+**Pampano** generates a network of contacts and bonds from a protein structure (PDB file). Each node is a residue (or atom), and each edge is a physical interaction between them — a covalent bond, a hydrogen bond, a salt bridge, a hydrophobic contact, and so on. It runs entirely in your browser; nothing is uploaded to a server.
+
+## Quick start
+
+- **Load a structure.** Upload a .pdb file, or type a 4-character PDB ID (e.g. @1CRN@, @4HHB@) and click **Fetch** to pull it from RCSB.
+- **Choose an assembly** (monomer, asymmetric unit, or biological assembly).
+- Click **Build Network.**
+- Explore: drag nodes, zoom/pan, recolor nodes and edges, filter edges, and **click any node** for a 3D view of that residue and its contacts.
+- **Export** as a CSV edge list or JSON graph (Cytoscape, Gephi, NetworkX, etc.).
+
+## Controls
+
+### Loading & assembly
+- **PDB file / Fetch by ID** — provide the structure either way. Fetch needs an internet connection and a valid RCSB entry.
+- **Assembly** — *Monomer* (first chain only), *Full asymmetric unit* (all chains as deposited), or *Biological assembly* (applies REMARK 350 BIOMT operators to rebuild the multimer; falls back to the asymmetric unit if no BIOMT records exist).
+
+### Network definition
+- **Granularity** — *Residue-level* (one node per residue; edges aggregate atom-atom contacts, keeping the closest distance and pair count) or *Atom-level* (one node per atom; more detailed, heavier).
+- **Contact cutoff (Å)** — maximum distance for two atoms to count as in contact (default 5.0).
+- **Atoms** — all atoms, heavy atoms only, or CA/representative only.
+
+### Visualization
+- **Color nodes by** — chain, hydrophobicity, SASA, residue type (charge/polarity), or degree.
+- **Size nodes by** — uniform, residue volume, SASA, or degree.
+- **Show edges** — filter to a single category (all, bonds, contacts, or one specific interaction/scope).
+- **Color edges by** — interaction type, contact scope, or a simple intra/inter split.
+
+### Advanced
+- **Covalent bonds only** — build a network of covalent linkages alone (~1.9 Å).
+- **Include intra-chain / inter-chain / inter-protomer contacts** — toggle each scope.
+- **Exclude sequential neighbors** — removes contacts between consecutive residues to show only tertiary/quaternary contacts. Off by default.
+- **Protomer groups** — group chains into protomers (e.g. @A,B ; C,D@) to separate within-protomer from between-protomer interfaces. Blank = classify inter-chain contacts automatically by sequence.
+- **Include HETATM** — include ligands, cofactors, ions, and water.
+
+### 3D inset
+Click any node to open a structural view of that residue and the residues it contacts. The selected residue shows full side-chain atoms and is highlighted; context and sequential residues show as backbone only, for orientation. Drag to rotate, scroll to zoom; background or × closes it.
+
+## Exports
+- **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, and covalent-bond flag per edge.
+- **JSON graph** — nodes (residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (distance, count, interaction, scope, bond flag).
+
+## Glossary
+
+### Structural scope (where a contact sits)
+- **Intra-chain** — both atoms in the same physical chain copy (same chain ID and symmetry operator). Internal to one subunit.
+- **Inter-chain** — atoms from different deposited chains (e.g. A and B). Subdivided automatically by sequence into:
+  - **Homotypic** — the two chains have the *same* sequence (same protein; typical homo-oligomer protomer interface).
+  - **Heterotypic** — the two chains have *different* sequences (different proteins; a true hetero-complex interface).
+- **Intra-protomer** — chains belonging to the *same* manually defined protomer group. An interface internal to a multi-chain protomer.
+- **Inter-protomer** — the same original chain under *different* BIOMT operators (e.g. A and A′). Exists only once the biological assembly is built; appears only in bio-assembly mode.
+
+> Chain labels (A, B, C…) are assigned by the depositor and don't inherently say which chains form one functional unit. Pampano classifies inter-chain contacts by sequence identity (unambiguous within one structure) and lets you override with explicit protomer groups when the biological grouping is something only you know.
+
+### Interaction types (what kind of contact)
+From strongest/most-specific to weakest; when several atom-pair interactions contribute to one residue edge, the strongest labels it.
+- **Peptide bond** — covalent backbone linkage between consecutive residues, C(i)–N(i+1). Detected from backbone geometry, not residue numbering.
+- **Disulfide** — covalent S–S bond between two cysteines (~2.05 Å).
+- **Covalent (other)** — any other covalent linkage (≤ ~1.95 Å), e.g. ligand attachments.
+- **Salt bridge** — oppositely charged groups within 4.0 Å: basic N (Arg, Lys, His) and acidic O (Asp, Glu).
+- **Hydrogen bond** — donor N/O and acceptor N/O within 3.5 Å that also pass an angle check (below).
+- **Hydrophobic** — carbon–carbon contact within 4.0 Å involving a hydrophobic residue.
+- **Van der Waals** — a close contact within the cutoff not meeting any more specific criterion.
+
+### Hydrogen-bond geometry
+Distance alone isn't enough; the angle is checked too.
+- **With explicit hydrogens** (all-atom scope, if present): true donor–H···acceptor angle ≥ 120° (near-linear).
+- **Without hydrogens** (usual for crystal structures): heavy-atom surrogate — the angle at the acceptor between the donor and the acceptor's bonded antecedent (D···A–AA) ≥ 90°, so the donor approaches from the lone-pair side.
+
+### Node properties
+- **Hydrophobicity** — Kyte–Doolittle hydropathy; higher = more hydrophobic.
+- **Residue volume** — approximate residue volume (Zamyatnin).
+- **SASA** — solvent-accessible surface area via a Shrake–Rupley approximation (1.4 Å probe, Fibonacci sphere sampling). At residue level also given relative to the maximum for that residue type (Tien et al.): buried (0) to exposed (1).
+- **Degree** — number of edges on a node; high-degree nodes are hubs.
+- **Base chain / operator** — original chain ID and BIOMT operator index for an atom copy (relevant in bio-assembly mode).
+
+### Other terms
+- **BIOMT** — transformation matrices in REMARK 350 specifying how to build the biological assembly.
+- **Asymmetric unit** — the coordinates actually deposited; may be a fraction or a multiple of the biological unit.
+- **Protomer** — the repeating structural unit of an oligomer; may be one chain or several.
+- **HETATM** — non-standard PDB residues: ligands, cofactors, ions, modified residues, water.
+
+## Caveats
+- **SASA is computed on the current selection** — an interface buried in the full complex looks exposed on an isolated monomer. Build the biological assembly for meaningful burial. It's also the heaviest step on large all-atom selections.
+- **Hydrogen bonds are approximate** — without explicit H the geometry is a heavy-atom surrogate, and His is treated as potentially positive regardless of protonation. Expect some difference from DSSP/HBPLUS.
+- **CA-only mode cannot resolve bond chemistry** — the backbone is approximated from CA(i)–CA(i+1) adjacency.
+- **Biological assemblies multiply atom count** by the number of operators; use residue-level granularity for large ones.
+- **Sequence classification is exact** — copies of the same protein share an identical sequence within one structure, so there's no fuzzy matching and no misclassification.`;
+
+// minimal markdown → HTML (headers, lists, blockquote, hr, bold/italic/code, paragraphs)
+function mdToHtml(md) {
+  const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const inline = s => esc(s)
+    .replace(/@([^@]+)@/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  const lines = md.split("\n");
+  let html = "", listStack = []; // track indent levels for nested lists
+  const closeLists = (toDepth=0) => { while (listStack.length > toDepth) { html += "</ul>"; listStack.pop(); } };
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/,"");
+    if (!line.trim()) { closeLists(); continue; }
+    const h = line.match(/^(#{1,3})\s+(.*)$/);
+    if (h) { closeLists(); html += `<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`; continue; }
+    if (/^---$/.test(line.trim())) { closeLists(); html += "<hr>"; continue; }
+    if (/^>\s?/.test(line)) { closeLists(); html += `<blockquote>${inline(line.replace(/^>\s?/,""))}</blockquote>`; continue; }
+    const li = line.match(/^(\s*)-\s+(.*)$/);
+    if (li) {
+      const depth = Math.floor(li[1].length / 2) + 1;
+      while (listStack.length < depth) { html += "<ul>"; listStack.push(1); }
+      closeLists(depth);
+      html += `<li>${inline(li[2])}</li>`;
+      continue;
+    }
+    closeLists();
+    html += `<p>${inline(line)}</p>`;
+  }
+  closeLists();
+  return html;
+}
+
+$("helpBody").innerHTML = mdToHtml(README);
+$("helpLink").addEventListener("click", e => { e.preventDefault(); $("helpModal").style.display = "flex"; });
+$("helpClose").addEventListener("click", () => { $("helpModal").style.display = "none"; });
+$("helpModal").addEventListener("click", e => { if (e.target.id === "helpModal") $("helpModal").style.display = "none"; });
+document.addEventListener("keydown", e => { if (e.key === "Escape") $("helpModal").style.display = "none"; });
 </script>
+<div id="helpModal" class="modal-backdrop" style="display:none">
+  <div class="modal">
+    <div class="modal-head">
+      <span>Pampano — Help &amp; Glossary</span>
+      <span id="helpClose" class="modal-close" title="Close">×</span>
+    </div>
+    <div class="modal-body" id="helpBody"></div>
+  </div>
+</div>
 </body>
 </html>
