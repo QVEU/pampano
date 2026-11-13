@@ -61,7 +61,7 @@ Click any node to open a structural view (bottom-left) of that residue and the r
 
 ## Offline version (large structures)
 
-For capsids, large biological assemblies or big atom-level networks that are too heavy for the browser, the [`offline/`](offline/) folder has a command-line version (Python with numpy/scipy, plus an optional small window via `--gui`). It builds the same network as this page and writes a Cytoscape-ready JSON plus CSV edge and node tables for R. See [offline/README.md](offline/README.md).
+For capsids, large biological assemblies or big atom-level networks that are too heavy for the browser, the [`offline/`](offline/) folder has a command-line version (Python with numpy/scipy, plus an optional form in your web browser via `--gui`). It reads PDB or mmCIF files, builds the same network as this page and writes a Cytoscape-ready JSON plus CSV edge and node tables for R. See [offline/README.md](offline/README.md).
 
 ---
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pampano offline: build Pampano's contact/bond network from a PDB file on the
+"""Pampano offline: build Pampano's contact/bond network from a PDB or mmCIF file on the
 command line, for structures too large for the browser (capsids, big
 bio-assemblies).
 
@@ -14,8 +14,9 @@ scope labels, backbone/sidechain partner parts and SASA) and writes:
                     plus node attributes for both ends (tidy, for R).
   <out>_nodes.csv   one row per node.
 
-Requires Python 3.8+, numpy and scipy.  Run with --help for options, or --gui
-for a small form.
+Requires Python 3.8+, numpy and scipy (truststore optional, for downloads on
+networks that inspect HTTPS). Run with --help for options, or --gui for a form
+in your web browser.
 """
 
 import argparse
@@ -25,14 +26,16 @@ import json
 import math
 import os
 import re
+import ssl
 import sys
 import time
+import urllib.error
 import urllib.request
 
 import numpy as np
 from scipy.spatial import cKDTree
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 # ---------------------------------------------------------------------------
 # property tables (copied from index.html)
@@ -78,8 +81,13 @@ EDGE_FILTERS = ["all", "bonds", "contacts", "peptide", "disulfide", "salt_bridge
                 "scope_heterotypic", "scope_inter_protomer"]
 
 
+_LOG_HOOKS = []      # extra log sinks (the browser form shows progress through one)
+
+
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
+    for hook in list(_LOG_HOOKS):
+        hook(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -172,10 +180,289 @@ def read_structure_text(path):
         return fh.read()
 
 
-def fetch_pdb(pdb_id):
-    url = "https://files.rcsb.org/download/%s.pdb" % pdb_id.lower()
-    with urllib.request.urlopen(url, timeout=60) as r:
-        return r.read().decode("utf-8", "replace")
+# ---------------------------------------------------------------------------
+# mmCIF parsing
+# ---------------------------------------------------------------------------
+_CIF_TOKEN = re.compile(r"""'(?:[^']|'(?=\S))*'(?=\s|$)|"(?:[^"]|"(?=\S))*"(?=\s|$)|#.*|\S+""")
+_CIF_WANTED = ("_atom_site.", "_pdbx_struct_assembly_gen.", "_pdbx_struct_oper_list.")
+
+
+def _cif_tokens(text):
+    """Yield (value, is_quoted) for a CIF text, handling quotes, comments and ;-text fields."""
+    lines = text.splitlines()
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line.startswith(";"):
+            buf = [line[1:]]
+            i += 1
+            while i < n and not lines[i].startswith(";"):
+                buf.append(lines[i])
+                i += 1
+            i += 1
+            yield "\n".join(buf).strip(), True
+            continue
+        i += 1
+        if "'" not in line and '"' not in line and "#" not in line:
+            for t in line.split():
+                yield t, False
+            continue
+        for m in _CIF_TOKEN.finditer(line):
+            t = m.group(0)
+            if t[0] == "#":
+                break
+            if t[0] in "'\"" and len(t) >= 2 and t[-1] == t[0]:
+                yield t[1:-1], True
+            else:
+                yield t, False
+
+
+def read_cif_categories(text, wanted=_CIF_WANTED):
+    """{category: {item: [values]}} for the wanted categories of the first data block."""
+    out = {}
+    toks = _cif_tokens(text)
+    pending = None                       # look-ahead token
+    blocks = 0
+
+    def nxt():
+        nonlocal pending
+        if pending is not None:
+            t, pending = pending, None
+            return t
+        return next(toks, None)
+
+    while True:
+        tok = nxt()
+        if tok is None:
+            break
+        v, q = tok
+        if not q and v.startswith("data_"):
+            blocks += 1
+            if blocks > 1:
+                break
+            continue
+        if not q and v.lower() == "loop_":
+            tags = []
+            while True:
+                t = nxt()
+                if t is None:
+                    break
+                if not t[1] and t[0].startswith("_"):
+                    tags.append(t[0])
+                else:
+                    pending = t
+                    break
+            keep = bool(tags) and tags[0].startswith(wanted)
+            cols = [[] for _ in tags]
+            k = 0
+            while True:
+                t = nxt()
+                if t is None:
+                    break
+                if not t[1] and (t[0].startswith("_") or t[0].lower() == "loop_" or t[0].startswith("data_")):
+                    pending = t
+                    break
+                if keep:
+                    cols[k].append(t[0])
+                k = (k + 1) % len(tags)
+            if keep:
+                cat = tags[0].split(".")[0]
+                out[cat] = {tg.split(".", 1)[1]: c for tg, c in zip(tags, cols)}
+            continue
+        if not q and v.startswith("_"):
+            val = nxt()
+            if v.startswith(wanted) and val is not None:
+                cat, item = v.split(".", 1)
+                out.setdefault(cat, {})[item] = [val[0]]
+    return out
+
+
+def _cif_null(v):
+    return v in ("?", ".")
+
+
+def _parse_oper_expression(expr):
+    """'(1-60)' -> [['1',...,'60']]; '(X0)(1-60)' -> [['X0'], ['1',...,'60']]; '1,2' -> [['1','2']]."""
+    groups = re.findall(r"\(([^)]*)\)", expr) or [expr]
+    out = []
+    for g in groups:
+        ids = []
+        for part in g.split(","):
+            part = part.strip()
+            m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+            if m:
+                ids.extend(str(k) for k in range(int(m.group(1)), int(m.group(2)) + 1))
+            elif part:
+                ids.append(part)
+        out.append(ids)
+    return out
+
+
+def parse_mmcif(text):
+    """Return {'atoms', 'biomt'} like parse_pdb, from an mmCIF file. Uses author
+    chain/residue/atom names (what PDB-format files carry) and the operators of
+    assembly 1 from pdbx_struct_assembly_gen / pdbx_struct_oper_list."""
+    cats = read_cif_categories(text)
+    site = cats.get("_atom_site")
+    if not site:
+        raise ValueError("no _atom_site records in the mmCIF file")
+    n = len(site["Cartn_x"])
+
+    def col(*names, default="?"):
+        for nm in names:
+            if nm in site:
+                return site[nm]
+        return [default] * n
+
+    group = col("group_PDB", default="ATOM")
+    alt = col("label_alt_id", default=".")
+    name = col("auth_atom_id", "label_atom_id")
+    resn = col("auth_comp_id", "label_comp_id")
+    chain = col("auth_asym_id", "label_asym_id")
+    asym = col("label_asym_id", "auth_asym_id")
+    seq = col("auth_seq_id", "label_seq_id")
+    icode = col("pdbx_PDB_ins_code")
+    elem = col("type_symbol")
+    xs, ys, zs = site["Cartn_x"], site["Cartn_y"], site["Cartn_z"]
+    atoms = []
+    for k in range(n):
+        a = "" if _cif_null(alt[k]) else alt[k]
+        if a not in ("", "A"):
+            continue
+        ch = "" if _cif_null(chain[k]) else chain[k]
+        el = "" if _cif_null(elem[k]) else elem[k]
+        if not el:
+            el = re.sub(r"[0-9]", "", name[k][:2])
+        atoms.append({
+            "hetatm": group[k] == "HETATM",
+            "name": name[k],
+            "resName": resn[k],
+            "chain": ch or "A",
+            "asym": asym[k],
+            "resSeq": None if _cif_null(seq[k]) else js_parse_int(seq[k]),
+            "iCode": "" if _cif_null(icode[k]) else icode[k],
+            "x": js_parse_float(xs[k]), "y": js_parse_float(ys[k]), "z": js_parse_float(zs[k]),
+            "element": el.upper(),
+        })
+
+    biomt = []
+    gen, opl = cats.get("_pdbx_struct_assembly_gen"), cats.get("_pdbx_struct_oper_list")
+    if gen and opl:
+        mats = {}
+        for r in range(len(opl["id"])):
+            m = [[float(opl["matrix[%d][%d]" % (i, j)][r]) for j in (1, 2, 3)] for i in (1, 2, 3)]
+            t = [float(opl["vector[%d]" % i][r]) for i in (1, 2, 3)]
+            mats[opl["id"][r]] = (m, t)
+        first_asm = gen["assembly_id"][0]
+        for r in range(len(gen["assembly_id"])):
+            if gen["assembly_id"][r] != first_asm:
+                continue
+            asyms = set(a.strip() for a in gen["asym_id_list"][r].split(",") if a.strip())
+            ops = None
+            for grp in reversed(_parse_oper_expression(gen["oper_expression"][r])):
+                # "(A)(B)" means apply B first, then A
+                ops = [mats[g] for g in grp] if ops is None else [_compose(mats[g], o) for g in grp for o in ops]
+            for m, t in ops:
+                biomt.append({"matrix": m, "trans": t, "chains": asyms})
+    return {"atoms": atoms, "biomt": biomt}
+
+
+def _compose(outer, inner):
+    """Operator that applies `inner` then `outer`."""
+    (A, a), (B, b) = outer, inner
+    M = [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+    t = [sum(A[i][k] * b[k] for k in range(3)) + a[i] for i in range(3)]
+    return M, t
+
+
+def is_mmcif(text, name=""):
+    low = name.lower()
+    if re.search(r"\.(cif|mmcif)(\.gz)?$", low):
+        return True
+    if re.search(r"\.(pdb|ent)(\.gz)?$", low):
+        return False
+    head = text.lstrip()[:200]
+    return head.startswith("data_") or "_atom_site." in text[:200000]
+
+
+def parse_structure(text, name=""):
+    return parse_mmcif(text) if is_mmcif(text, name) else parse_pdb(text)
+
+
+RCSB_CIF_URL = "https://files.rcsb.org/download/{id}.cif.gz"
+RCSB_URL = "https://files.rcsb.org/download/{id}.pdb.gz"
+CA_ENV_VARS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")
+
+
+def ssl_context(ca_bundle=None):
+    """TLS context for downloads, always verifying certificates. Uses, in order:
+    an explicit CA bundle (--ca-bundle, or SSL_CERT_FILE / REQUESTS_CA_BUNDLE /
+    CURL_CA_BUNDLE), else the operating system's trust store via the optional
+    `truststore` package (picks up institutional proxy certificates installed in
+    the macOS keychain or Windows store), else Python's default CA list."""
+    path = ca_bundle
+    if not path:
+        path = next((os.environ[v] for v in CA_ENV_VARS if os.environ.get(v)), None)
+    if path:
+        path = os.path.expanduser(path)
+        if not os.path.exists(path):
+            raise FetchError("CA bundle not found: %s" % path)
+        return ssl.create_default_context(cafile=path), "CA bundle %s" % path
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT), "system trust store"
+    except ImportError:
+        return ssl.create_default_context(), "Python default certificates"
+
+
+class FetchError(Exception):
+    pass
+
+
+def _download(url, ctx):
+    with urllib.request.urlopen(url, timeout=120, context=ctx) as r:
+        data = r.read()
+    try:
+        return gzip.decompress(data)
+    except OSError:
+        return data                            # server sent it uncompressed
+
+
+def fetch_entry(pdb_id, ca_bundle=None):
+    """Download an entry from RCSB, mmCIF first (every entry has one), falling
+    back to legacy PDB format. Returns (text, file_name)."""
+    pdb_id = pdb_id.strip().upper()
+    if not re.fullmatch(r"[0-9][A-Z0-9]{3}", pdb_id):
+        raise FetchError("'%s' is not a 4-character PDB ID" % pdb_id)
+    ctx, how = ssl_context(ca_bundle)
+    manual = ("Download it in a browser (https://www.rcsb.org/structure/%s, Download Files > PDBx/mmCIF) "
+              "and pass the file instead of --pdb-id." % pdb_id)
+    last = None
+    for fmt, tmpl in (("cif", RCSB_CIF_URL), ("pdb", RCSB_URL)):
+        url = tmpl.format(id=pdb_id, mid=pdb_id[1:3].lower(), lid=pdb_id.lower())
+        try:
+            data = _download(url, ctx)
+            return data.decode("utf-8", "replace"), "%s.%s" % (pdb_id, fmt)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                last = e
+                continue
+            raise FetchError("RCSB returned HTTP %d for %s. %s" % (e.code, url, manual))
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
+                raise FetchError(
+                    "Could not verify RCSB's certificate (%s; checked with the %s). This usually means a "
+                    "network that inspects HTTPS traffic (common on institutional networks/VPNs) with its own "
+                    "root certificate. Fixes, easiest first:\n"
+                    "  1. pip install truststore   (or: conda install -c conda-forge truststore) so the tool "
+                    "trusts the certificates your operating system already trusts;\n"
+                    "  2. --ca-bundle /path/to/your-institution-ca.pem   (or set SSL_CERT_FILE); ask IT for "
+                    "the root certificate, or export it from Keychain Access;\n"
+                    "  3. %s" % (getattr(reason, "verify_message", None) or reason, how, manual))
+            raise FetchError("Could not reach RCSB (%s). %s" % (reason, manual))
+    raise FetchError("RCSB has no entry %s (HTTP 404). Check the ID; very new entries can take a few days to "
+                     "appear." % pdb_id)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +503,7 @@ def atoms_from_parsed(raw):
         resName=[a["resName"] for a in raw],
         chain=[a["chain"] for a in raw],
         baseChain=[a["chain"] for a in raw],
+        asym=[a.get("asym", a["chain"]) for a in raw],
         resSeq=np.array([r if r is not None else 0 for r in res_seq], dtype=np.int64).reshape(n),
         resSeqNaN=np.array([r is None for r in res_seq], dtype=bool).reshape(n),
         iCode=[a["iCode"] for a in raw],
@@ -242,7 +530,8 @@ def apply_biomt(atoms, biomt):
     parts = []
     for oi, op in enumerate(biomt):
         if op["chains"] is not None:
-            keep = np.array([c in op["chains"] for c in atoms.chain], dtype=bool)
+            # PDB: chain IDs from REMARK 350; mmCIF: label_asym_ids from pdbx_struct_assembly_gen
+            keep = np.array([c in op["chains"] for c in atoms.asym], dtype=bool)
             idx = np.nonzero(keep)[0]
         else:
             idx = np.arange(len(atoms))
@@ -1129,20 +1418,27 @@ def default_opts():
             "includeHetatm": False, "sasa": False}
 
 
-def run(input_path=None, pdb_id=None, out_prefix=None, opts=None, edge_filter="all", verbose=True):
+def run(input_path=None, pdb_id=None, out_prefix=None, opts=None, edge_filter="all", verbose=True,
+        ca_bundle=None, save=None):
     opts = dict(default_opts(), **(opts or {}))
     t0 = time.time()
     if pdb_id:
-        name = pdb_id.upper()
         if verbose:
-            log("Fetching %s from RCSB" % name)
-        text = fetch_pdb(pdb_id)
+            log("Fetching %s from RCSB" % pdb_id.upper())
+        text, name = fetch_entry(pdb_id, ca_bundle)
+        if save:
+            if os.path.isdir(save):
+                save = os.path.join(save, name)
+            with open(save, "w") as fh:
+                fh.write(text)
+            if verbose:
+                log("  saved %s" % save)
     else:
         name = os.path.basename(input_path)
         text = read_structure_text(input_path)
-    parsed = parse_pdb(text)
+    parsed = parse_structure(text, name)
     if verbose:
-        log("Parsed %s: %d atoms, %d BIOMT operators" % (name, len(parsed["atoms"]), len(parsed["biomt"])))
+        log("Parsed %s (%s): %d atoms, %d assembly operators" % (name, "mmCIF" if is_mmcif(text, name) else "PDB", len(parsed["atoms"]), len(parsed["biomt"])))
     if opts["assemblyMode"] in ("bioassembly", "biocontacts") and not parsed["biomt"] and verbose:
         log("  No BIOMT records; using the asymmetric unit.")
     atoms = prepare_atoms(parsed, opts)
@@ -1165,11 +1461,15 @@ def run(input_path=None, pdb_id=None, out_prefix=None, opts=None, edge_filter="a
 def build_parser():
     p = argparse.ArgumentParser(
         prog="pampano_offline.py",
-        description="Build Pampano's residue/atom contact network from a PDB file and write Cytoscape JSON "
+        description="Build Pampano's residue/atom contact network from a PDB or mmCIF file and write Cytoscape JSON "
                     "plus CSV edge and node tables. Same network as the browser app; no size limit.")
     src = p.add_mutually_exclusive_group()
-    src.add_argument("input", nargs="?", help="PDB file (.pdb, .ent, optionally .gz)")
-    src.add_argument("--pdb-id", help="fetch this 4-character entry from RCSB instead of reading a file")
+    src.add_argument("input", nargs="?", help="structure file: PDB (.pdb, .ent) or mmCIF (.cif), optionally .gz")
+    src.add_argument("--pdb-id", help="download this 4-character entry from RCSB (mmCIF) instead of reading a file")
+    p.add_argument("--ca-bundle", metavar="PEM",
+                   help="CA certificate bundle for --pdb-id downloads (for networks that inspect HTTPS); "
+                        "SSL_CERT_FILE / REQUESTS_CA_BUNDLE are also honoured")
+    p.add_argument("--save", metavar="PATH", help="with --pdb-id, also save the downloaded file (file name or folder)")
     p.add_argument("-o", "--out", help="output prefix (default: <file>_<assembly>_<granularity>); writes "
                                        "PREFIX.json, PREFIX_edges.csv, PREFIX_nodes.csv")
     p.add_argument("-a", "--assembly", choices=ASSEMBLY_MODES, default="asym",
@@ -1191,7 +1491,11 @@ def build_parser():
     p.add_argument("--edge-filter", choices=EDGE_FILTERS, default="all", metavar="FILTER",
                    help="write only these edges: " + ", ".join(EDGE_FILTERS) +
                         " (default all); degree is counted on written edges")
-    p.add_argument("--gui", action="store_true", help="open a small form instead of using the command line")
+    p.add_argument("--gui", action="store_true",
+                   help="open a form in your web browser instead of using the command line (other options "
+                        "given here pre-fill it)")
+    p.add_argument("--port", type=int, default=0, help=argparse.SUPPRESS)
+    p.add_argument("--no-browser", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("-q", "--quiet", action="store_true")
     p.add_argument("--version", action="version", version=__version__)
     return p
@@ -1211,100 +1515,218 @@ def main(argv=None):
     p = build_parser()
     a = p.parse_args(argv)
     if a.gui:
-        return run_gui()
+        # the form starts from whatever options were given on the command line
+        return run_gui({
+            "assembly": a.assembly, "granularity": a.granularity, "cutoff": a.cutoff, "atoms": a.atoms,
+            "edgeFilter": a.edge_filter, "groups": a.protomer_groups, "intraChain": not a.no_intra_chain,
+            "interChain": not a.no_inter_chain, "interProtomer": not a.no_inter_protomer,
+            "covalentOnly": a.covalent_only, "excludeSeqAdj": a.exclude_seq_adjacent, "hetatm": a.hetatm,
+            "sasa": a.sasa, "pdbId": a.pdb_id or "",
+            "outDir": os.path.dirname(os.path.abspath(a.out)) if a.out else None,
+            "prefix": os.path.basename(a.out) if a.out else None,
+        }, open_browser=not a.no_browser, port=a.port)
     if not a.input and not a.pdb_id:
         p.error("give a PDB file or --pdb-id (or --gui)")
-    run(a.input, a.pdb_id, a.out, opts_from_args(a), a.edge_filter, verbose=not a.quiet)
+    if a.input and not os.path.exists(a.input):
+        p.error("file not found: %s" % a.input)
+    try:
+        run(a.input, a.pdb_id, a.out, opts_from_args(a), a.edge_filter, verbose=not a.quiet,
+            ca_bundle=a.ca_bundle, save=a.save)
+    except FetchError as e:
+        log("Error: %s" % e)
+        return 2
     return 0
 
 
 # ---------------------------------------------------------------------------
-# minimal Tk GUI
+# GUI: a small form served on localhost and opened in the web browser.
+# (Pure standard library; no Tk, which crashes with some macOS/conda builds.)
 # ---------------------------------------------------------------------------
-def run_gui():
+GUI_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><title>Pampano offline</title>
+<style>
+body{font:14px system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;color:#1f2937;background:#f8fafc}
+h1{font-size:20px;margin:0 0 4px} p.sub{color:#6b7280;margin:0 0 16px}
+fieldset{border:1px solid #d1d5db;border-radius:8px;margin:0 0 12px;padding:10px 14px;background:#fff}
+legend{font-weight:600;padding:0 4px} label{display:block;margin:6px 0}
+.row{display:grid;grid-template-columns:170px 1fr;gap:8px;align-items:center;margin:6px 0}
+input[type=text],input[type=number],select{width:100%;box-sizing:border-box;padding:5px;border:1px solid #cbd5e1;border-radius:5px}
+button{padding:8px 18px;border:0;border-radius:6px;background:#2563eb;color:#fff;font-size:14px;cursor:pointer}
+button:disabled{background:#94a3b8} button.sec{background:#e5e7eb;color:#111}
+pre{background:#0f172a;color:#e2e8f0;padding:10px;border-radius:8px;white-space:pre-wrap;min-height:60px;max-height:320px;overflow:auto}
+.ok{color:#15803d;font-weight:600} .err{color:#b91c1c;font-weight:600}
+</style></head><body>
+<h1>Pampano offline</h1><p class="sub">Builds the network on this computer and writes JSON (Cytoscape) and CSV files.</p>
+<fieldset><legend>Structure</legend>
+<div class="row"><span>File (PDB or mmCIF)</span><input type="file" id="file" accept=".pdb,.ent,.cif,.mmcif,.gz,.txt"></div>
+<div class="row"><span>or PDB ID to download</span><input type="text" id="pdbId" maxlength="4" placeholder="e.g. 9MXC"></div>
+</fieldset>
+<fieldset><legend>Network</legend>
+<div class="row"><span>Assembly</span><select id="assembly">
+<option value="monomer">Monomer (first chain)</option><option value="asym">Full asymmetric unit</option>
+<option value="bioassembly">Biological assembly (every copy gets nodes)</option>
+<option value="biocontacts">Bio-assembly contacts on asym unit</option></select></div>
+<div class="row"><span>Granularity</span><select id="granularity"><option value="residue">Residue</option><option value="atom">Atom</option></select></div>
+<div class="row"><span>Cutoff (Å)</span><input type="number" id="cutoff" step="0.5" min="1"></div>
+<div class="row"><span>Atoms</span><select id="atoms"><option value="heavy">Heavy only</option><option value="all">All</option><option value="ca">CA/representative</option></select></div>
+<div class="row"><span>Edges written</span><select id="edgeFilter">%EDGE_OPTIONS%</select></div>
+<div class="row"><span>Protomer groups</span><input type="text" id="groups" placeholder="e.g. A,B ; C,D"></div>
+<label><input type="checkbox" id="intraChain"> Include intra-chain contacts</label>
+<label><input type="checkbox" id="interChain"> Include inter-chain contacts</label>
+<label><input type="checkbox" id="interProtomer"> Include inter-protomer contacts</label>
+<label><input type="checkbox" id="covalentOnly"> Covalent bonds only</label>
+<label><input type="checkbox" id="excludeSeqAdj"> Exclude sequential neighbours</label>
+<label><input type="checkbox" id="hetatm"> Include HETATM (ligands, ions, water)</label>
+<label><input type="checkbox" id="sasa"> Compute SASA (slow on very large assemblies)</label>
+</fieldset>
+<fieldset><legend>Output</legend>
+<div class="row"><span>Folder</span><input type="text" id="outDir"></div>
+<div class="row"><span>File prefix (optional)</span><input type="text" id="prefix" placeholder="default: name_assembly_granularity"></div>
+</fieldset>
+<button id="go">Build network</button> <button id="quit" class="sec">Quit</button>
+<p id="state"></p><pre id="log"></pre>
+<script>
+const D = %DEFAULTS%;
+const $ = id => document.getElementById(id);
+for (const [k,v] of Object.entries(D)) { const el=$(k); if(!el) continue; if(el.type==="checkbox") el.checked=!!v; else el.value=v; }
+let timer=null;
+async function poll(){
+  const s = await (await fetch("/status")).json();
+  $("log").textContent = s.log.join("\n"); $("log").scrollTop = 1e9;
+  if (s.running) return;
+  clearInterval(timer); $("go").disabled=false;
+  if (s.error) $("state").innerHTML = '<span class="err">Failed:</span> ' + s.error.replace(/</g,"&lt;").replace(/\n/g,"<br>");
+  else if (s.result) $("state").innerHTML = '<span class="ok">Done:</span> ' + s.result.nodes + " nodes, " + s.result.edges + " edges. Files written:<br>" + s.result.paths.join("<br>");
+}
+$("go").onclick = async () => {
+  const f = $("file").files[0], id = $("pdbId").value.trim();
+  if (!f && !id) { $("state").textContent = "Choose a file or type a PDB ID."; return; }
+  const opts = {};
+  for (const k of Object.keys(D)) { const el=$(k); if(el) opts[k] = el.type==="checkbox" ? el.checked : el.value; }
+  opts.pdbId = f ? "" : id; opts.fileName = f ? f.name : "";
+  $("go").disabled = true; $("state").textContent = "Building… large assemblies can take a few minutes."; $("log").textContent="";
+  const r = await fetch("/run?opts=" + encodeURIComponent(JSON.stringify(opts)), {method:"POST", body: f || ""});
+  if (!r.ok) { $("state").innerHTML = '<span class="err">' + (await r.text()) + '</span>'; $("go").disabled=false; return; }
+  timer = setInterval(poll, 500);
+};
+$("quit").onclick = async () => { await fetch("/quit", {method:"POST"}); document.body.innerHTML = "<p>Pampano offline has stopped. You can close this tab.</p>"; };
+</script></body></html>"""
+
+
+def run_gui(defaults=None, open_browser=True, port=0):
+    """Serve the form on 127.0.0.1 and open it in the default browser."""
+    import http.server
+    import tempfile
     import threading
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    import urllib.parse
+    import webbrowser
 
-    root = tk.Tk()
-    root.title("Pampano offline")
-    v = {
-        "input": tk.StringVar(), "out": tk.StringVar(), "assembly": tk.StringVar(value="biocontacts"),
-        "granularity": tk.StringVar(value="residue"), "cutoff": tk.StringVar(value="5.0"),
-        "atoms": tk.StringVar(value="heavy"), "groups": tk.StringVar(), "edge_filter": tk.StringVar(value="all"),
-    }
-    flags = {k: tk.BooleanVar(value=d) for k, d in [
-        ("covalentOnly", False), ("intraChain", True), ("interChain", True), ("interProtomer", True),
-        ("excludeSeqAdj", False), ("includeHetatm", False), ("sasa", False)]}
-    frm = ttk.Frame(root, padding=12)
-    frm.grid(sticky="nsew")
-    row = 0
+    d = {"assembly": "biocontacts", "granularity": "residue", "cutoff": 5.0, "atoms": "heavy",
+         "edgeFilter": "all", "groups": "", "intraChain": True, "interChain": True, "interProtomer": True,
+         "covalentOnly": False, "excludeSeqAdj": False, "hetatm": False, "sasa": False,
+         "outDir": os.getcwd(), "prefix": "", "pdbId": ""}
+    d.update({k: v for k, v in (defaults or {}).items() if v is not None})
+    html = GUI_HTML.replace("%DEFAULTS%", json.dumps(d)).replace(
+        "%EDGE_OPTIONS%", "".join('<option value="%s">%s</option>' % (e, e) for e in EDGE_FILTERS))
+    state = {"running": False, "log": [], "result": None, "error": None}
+    lock = threading.Lock()
 
-    def browse_in():
-        f = filedialog.askopenfilename(filetypes=[("PDB", "*.pdb *.ent *.pdb.gz *.ent.gz *.txt"), ("All", "*")])
-        if f:
-            v["input"].set(f)
-            if not v["out"].get():
-                stem = re.sub(r"(\.gz)?$", "", f)
-                v["out"].set(os.path.splitext(stem)[0] + "_pampano")
-
-    def browse_out():
-        f = filedialog.asksaveasfilename(defaultextension="")
-        if f:
-            v["out"].set(re.sub(r"\.json$", "", f))
-
-    for label, key, btn in [("PDB file", "input", browse_in), ("Output prefix", "out", browse_out)]:
-        ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=v[key], width=50).grid(row=row, column=1, sticky="we")
-        ttk.Button(frm, text="Browse…", command=btn).grid(row=row, column=2)
-        row += 1
-    for label, key, values in [("Assembly", "assembly", ASSEMBLY_MODES), ("Granularity", "granularity",
-                                                                          ["residue", "atom"]),
-                               ("Atoms", "atoms", ["all", "heavy", "ca"]), ("Edges", "edge_filter", EDGE_FILTERS)]:
-        ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w")
-        ttk.Combobox(frm, textvariable=v[key], values=values, state="readonly").grid(row=row, column=1, sticky="w")
-        row += 1
-    for label, key in [("Cutoff (Å)", "cutoff"), ("Protomer groups", "groups")]:
-        ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w")
-        ttk.Entry(frm, textvariable=v[key], width=20).grid(row=row, column=1, sticky="w")
-        row += 1
-    for key, label in [("covalentOnly", "Covalent bonds only"), ("intraChain", "Intra-chain contacts"),
-                       ("interChain", "Inter-chain contacts"), ("interProtomer", "Inter-protomer contacts"),
-                       ("excludeSeqAdj", "Exclude sequential neighbours"), ("includeHetatm", "Include HETATM"),
-                       ("sasa", "Compute SASA (slow on huge assemblies)")]:
-        ttk.Checkbutton(frm, text=label, variable=flags[key]).grid(row=row, column=1, sticky="w")
-        row += 1
-    status = tk.StringVar(value="Pick a PDB file and press Build.")
-    ttk.Label(frm, textvariable=status, wraplength=480).grid(row=row + 1, column=0, columnspan=3, sticky="w")
-    btn = ttk.Button(frm, text="Build network")
-    btn.grid(row=row, column=1, sticky="w", pady=8)
-
-    def work():
+    def job(opts, upload):
+        tmpdir = None
         try:
-            opts = {k: b.get() for k, b in flags.items()}
-            opts.update(assemblyMode=v["assembly"].get(), granularity=v["granularity"].get(),
-                        cutoff=float(v["cutoff"].get()), atomScope=v["atoms"].get(),
-                        protomerGroups=parse_protomer_groups(v["groups"].get()),
-                        protomerGroupsText=v["groups"].get())
-            g, paths = run(v["input"].get(), None, v["out"].get() or None, opts, v["edge_filter"].get())
-            msg = "Done: %d nodes, %d edges.\n%s" % (len(g["nodes"]["id"]), len(g["links"]["source"]),
-                                                     "\n".join(paths))
-            root.after(0, lambda: (status.set(msg), btn.state(["!disabled"])))
-        except Exception as exc:  # show any failure in the window
-            err = str(exc)
-            root.after(0, lambda: (status.set("Failed: " + err), btn.state(["!disabled"]),
-                                   messagebox.showerror("Pampano", err)))
+            with lock:
+                state.update(running=True, log=[], result=None, error=None)
+            _LOG_HOOKS.append(lambda m: state["log"].append(m))
+            path = None
+            if upload is not None:
+                tmpdir = tempfile.mkdtemp(prefix="pampano_")
+                path = os.path.join(tmpdir, os.path.basename(opts.get("fileName") or "upload.pdb"))
+                with open(path, "wb") as fh:
+                    fh.write(upload)
+            out_dir = os.path.expanduser(opts.get("outDir") or os.getcwd())
+            os.makedirs(out_dir, exist_ok=True)
+            prefix = opts.get("prefix", "").strip()
+            o = {"assemblyMode": opts["assembly"], "granularity": opts["granularity"],
+                 "cutoff": float(opts["cutoff"]), "atomScope": opts["atoms"],
+                 "covalentOnly": bool(opts["covalentOnly"]), "intraChain": bool(opts["intraChain"]),
+                 "interChain": bool(opts["interChain"]), "interProtomer": bool(opts["interProtomer"]),
+                 "protomerGroups": parse_protomer_groups(opts.get("groups", "")),
+                 "protomerGroupsText": opts.get("groups", ""), "excludeSeqAdj": bool(opts["excludeSeqAdj"]),
+                 "includeHetatm": bool(opts["hetatm"]), "sasa": bool(opts["sasa"])}
+            if not prefix:
+                stem = opts.get("fileName") or opts.get("pdbId") or "structure"
+                stem = os.path.splitext(re.sub(r"(\.gz)?$", "", os.path.basename(stem)))[0]
+                prefix = "%s_%s_%s" % (stem, o["assemblyMode"], o["granularity"])
+            g, paths = run(path, opts.get("pdbId") or None, os.path.join(out_dir, prefix), o,
+                           opts.get("edgeFilter", "all"))
+            state["result"] = {"nodes": len(g["nodes"]["id"]), "edges": len(g["links"]["source"]),
+                               "paths": [os.path.abspath(p) for p in paths]}
+        except Exception as exc:          # report any failure in the page
+            state["error"] = str(exc) or exc.__class__.__name__
+            log("Error: %s" % state["error"])
+        finally:
+            _LOG_HOOKS.clear()
+            state["running"] = False
+            if tmpdir:
+                import shutil
+                shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def start():
-        if not v["input"].get():
-            messagebox.showwarning("Pampano", "Choose a PDB file first.")
-            return
-        btn.state(["disabled"])
-        status.set("Building… (large assemblies can take a few minutes)")
-        threading.Thread(target=work, daemon=True).start()
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
 
-    btn.configure(command=start)
-    root.mainloop()
+        def _send(self, code, body, ctype="text/plain; charset=utf-8"):
+            data = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path == "/":
+                self._send(200, html, "text/html; charset=utf-8")
+            elif self.path == "/status":
+                self._send(200, json.dumps(state), "application/json")
+            else:
+                self._send(404, "not found")
+
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+            if u.path == "/quit":
+                self._send(200, "bye")
+                threading.Thread(target=server.shutdown, daemon=True).start()
+                return
+            if u.path != "/run":
+                return self._send(404, "not found")
+            if state["running"]:
+                return self._send(409, "A build is already running.")
+            try:
+                opts = json.loads(urllib.parse.parse_qs(u.query)["opts"][0])
+            except (KeyError, ValueError):
+                return self._send(400, "bad request")
+            upload = body if opts.get("fileName") else None
+            state["running"] = True
+            threading.Thread(target=job, args=(opts, upload), daemon=True).start()
+            self._send(200, "started")
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    url = "http://127.0.0.1:%d/" % server.server_address[1]
+    log("Pampano offline form: %s  (Ctrl+C or the Quit button to stop)" % url)
+    if open_browser:
+        try:
+            if not webbrowser.open(url):
+                log("Open that address in your web browser.")
+        except Exception:
+            log("Open that address in your web browser.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
     return 0
 
 
