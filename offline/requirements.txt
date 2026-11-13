@@ -1,2 +1,3 @@
 numpy>=1.20
 scipy>=1.6
+truststore>=0.9   # optional: --pdb-id downloads trust the OS certificate store

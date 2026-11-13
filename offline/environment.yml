@@ -6,7 +6,7 @@ name: pampano
 channels:
   - conda-forge
 dependencies:
-  - python>=3.9
+  - python>=3.10
   - numpy>=1.20
   - scipy>=1.6
-  - tk          # only for the optional --gui form
+  - truststore  # lets --pdb-id downloads trust your OS certificates (institutional networks)

@@ -12,7 +12,7 @@ For example, the full 3VBS capsid (60 copies, 50,520 residues, 312,120 edges) ta
 
 ## Install
 
-You need Python 3.8 or newer with **numpy** and **scipy**. If you already have them, there is nothing to install: just run the script.
+You need Python 3.8 or newer with **numpy** and **scipy**. If you already have them, there is nothing to install: just run the script. **truststore** is optional and only matters for `--pdb-id` downloads on networks that inspect HTTPS (see [Downloading by PDB ID](#downloading-by-pdb-id)).
 
 Otherwise, use the conda environment in this folder:
 
@@ -28,8 +28,9 @@ or pip: `pip install -r requirements.txt`.
 ```bash
 cd offline
 
-# residue network of the asymmetric unit
+# residue network of the asymmetric unit (PDB or mmCIF file)
 python pampano_offline.py 1abc.pdb
+python pampano_offline.py 1abc.cif
 
 # full biological assembly (every symmetry copy gets its own nodes)
 python pampano_offline.py 3vbs.pdb -a bioassembly -o 3vbs_capsid
@@ -37,14 +38,30 @@ python pampano_offline.py 3vbs.pdb -a bioassembly -o 3vbs_capsid
 # one copy of each chain, with every contact to neighbouring copies mapped back
 python pampano_offline.py 3vbs.pdb -a biocontacts -o 3vbs_asu
 
-# fetch from RCSB instead of a local file (needs internet)
-python pampano_offline.py --pdb-id 4hhb
+# download from RCSB instead of a local file (needs internet; keeps a copy)
+python pampano_offline.py --pdb-id 9mxc -a biocontacts --save .
 
-# a small form instead of the command line
+# a form in your web browser instead of the command line
 python pampano_offline.py --gui
 ```
 
-Progress goes to the terminal; `-q` silences it. Input can be `.pdb`, `.ent` or either gzipped (`.pdb.gz`, `.ent.gz`, as downloaded from the PDB archive). Like the web app, only PDB format is read, not mmCIF.
+Progress goes to the terminal; `-q` silences it. Input can be PDB format (`.pdb`, `.ent`) or mmCIF (`.cif`), either one optionally gzipped (`.pdb.gz`, `.cif.gz`, as downloaded from the PDB archive).
+
+**`--gui`** opens a form in your web browser (served only to your own computer, on 127.0.0.1) with the same options; any options you put on the command line pre-fill it. Files are written to the folder shown in the form. Stop it with the Quit button or Ctrl+C. It needs nothing beyond Python itself.
+
+### PDB or mmCIF?
+
+Either works and gives the same network. mmCIF is the PDB's primary format and every entry has one; legacy PDB-format files don't exist for entries with more than 62 chains or 99,999 atoms. From mmCIF the tool uses the author chain, residue and atom names (the ones PDB files and the web app show) and builds assemblies from `pdbx_struct_assembly_gen` / `pdbx_struct_oper_list` (assembly 1, including combined operators like `(1-60)(61-62)`).
+
+Compared on 12 entries (1CRN, 4E43, 1HVR, 1A28, 4HHB, 1STP, 1OSM, 6VXX, 1AON, 2PLV, 3VBS, 9MXC) across asym unit, bio-assembly and bio-contacts modes, residue and atom level, with and without HETATM: the networks have the same nodes and the same edges with the same interaction types, scopes, partner parts and atom-pair counts. The only difference is in assemblies: mmCIF stores the symmetry matrices with 8 decimals and PDB files with 6, so a few distances differ in the third decimal (e.g. 3.797 vs 3.798 Å), and in 3VBS atom-level bio-contacts one atom pair sits right at the 5 Å cutoff and is in one file's network but not the other's (80,523 vs 80,522 edges). For a single asymmetric unit the two are byte-identical.
+
+### Downloading by PDB ID
+
+`--pdb-id XXXX` downloads the mmCIF file from RCSB (falling back to PDB format) and `--save PATH` keeps a copy. Certificates are always verified. If you see *Could not verify RCSB's certificate*, your network (often an institutional network or VPN) inspects HTTPS with its own root certificate, which Python doesn't know about. Fixes, easiest first:
+
+1. `pip install truststore` (or `conda install -c conda-forge truststore`; it's in `environment.yml`). The tool then trusts whatever your operating system trusts, which on managed computers includes the institution's certificate.
+2. Point the tool at the certificate: `--ca-bundle /path/to/institution-ca.pem`, or set `SSL_CERT_FILE` (also honoured: `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`). Your IT department can provide the file, or export it from Keychain Access on a Mac.
+3. Download the file in a browser from rcsb.org and pass it as a file.
 
 ## Options
 
@@ -66,6 +83,8 @@ Each option matches a control in the web app.
 | `--sasa` | Color/size by SASA (computes SASA) | off |
 | `--edge-filter FILTER` | Show edges: `all`, `bonds`, `contacts`, `peptide`, `disulfide`, `salt_bridge`, `hydrogen_bond`, `hydrophobic`, `scope_intra`, `scope_intra_protomer`, `scope_homotypic`, `scope_heterotypic`, `scope_inter_protomer` | `all` |
 | `-o, --out PREFIX` | output file prefix | `<file>_<assembly>_<granularity>` |
+| `--pdb-id XXXX`, `--save PATH`, `--ca-bundle PEM` | download instead of reading a file (see above) | |
+| `--gui` | open the browser form | |
 
 `--edge-filter` writes only the matching edges, and node degree is counted on those edges, just as the web app's degree follows the shown edges. Nodes are kept either way. For analysis it is usually simpler to write all edges and filter in R.
 
@@ -184,5 +203,5 @@ python parity.py configs.json browser.json     # prints OK/DIFF per configuratio
 
 ## Limits
 
-- PDB format only (no mmCIF), like the web app. Entries too large for PDB format (over 62 chains or 99,999 atoms in the asymmetric unit) are distributed only as mmCIF and can't be read yet. Capsids like 3VBS are fine, because the PDB file holds one asymmetric unit and the assembly is built from its BIOMT records.
+- The web app reads PDB format only, so for mmCIF-only entries there is no browser result to compare with. Binary CIF (`.bcif`) is not read.
 - Memory grows with the number of atom pairs: about 1.2 GB for the 3VBS capsid at residue level, 1.8 GB at atom level (390,000 nodes, 4.8 million edges; 1.5 GB JSON).
