@@ -58,6 +58,10 @@ Click any node to open a structural view (bottom-left) of that residue and the r
 - **CSV edge list** — one row per edge: node indices and labels, minimum distance, atom-pair count, interaction type, scope, whether it is a covalent bond, `source_part` / `target_part` (backbone, sidechain or hetatm for each partner) and `part_counts`.
 - **JSON graph** — nodes (with per-node properties: residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (with distance, count, interaction, scope, bond flag, source/target part, part counts).
 
+## Offline version (large structures)
+
+For capsids, large biological assemblies or big atom-level networks that are too heavy for the browser, the [`offline/`](offline/) folder has a command-line version (Python with numpy/scipy, plus an optional small window via `--gui`). It builds the same network as this page and writes a Cytoscape-ready JSON plus CSV edge and node tables for R. See [offline/README.md](offline/README.md).
+
 ---
 
 ## Glossary
