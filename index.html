@@ -1534,6 +1534,9 @@ Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, io
 - **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, covalent-bond flag, and backbone/sidechain/HETATM part of each partner (plus per-part atom-pair counts) per edge.
 - **JSON graph** — nodes (residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (distance, count, interaction, scope, bond flag, source/target part, part counts).
 
+## Offline version (large structures)
+For capsids, large biological assemblies or big atom-level networks that are too heavy for the browser, the *offline/* folder of the Pampano repository has a command-line version (Python with numpy/scipy, optional small window). It builds the same network as this page and writes a Cytoscape-ready JSON plus CSV edge and node tables for R.
+
 ## Glossary
 
 ### Structural scope (where a contact sits)
