@@ -220,7 +220,7 @@
 
   <button id="buildBtn" disabled>Build Network</button>
   <button class="secondary" id="exportBtn" disabled>Export edges (CSV)</button>
-  <button class="secondary" id="exportJsonBtn" disabled>Export graph (JSON)</button>
+  <button class="secondary" id="exportJsonBtn" disabled>Export graph (JSON for Cytoscape)</button>
 
   <div id="stats"></div>
 </div>
@@ -1445,8 +1445,12 @@ $("fetchBtn").addEventListener("click", async () => {
   $("fetchBtn").textContent = "Fetch";
 });
 
+let loadedName = null;   // file name / PDB ID of the loaded structure (for exports)
+let builtOpts = null;    // options the current graph was built with
+
 function loadText(text, name) {
   parsed = parsePDB(text);
+  loadedName = name;
   $("buildBtn").disabled = false;
   const chains = [...new Set(parsed.atoms.filter(a=>!a.hetatm).map(a=>a.chain))];
   $("asmNote").textContent = parsed.biomt.length
@@ -1463,6 +1467,7 @@ $("buildBtn").addEventListener("click", () => {
   setTimeout(() => {
     const atoms = prepareAtoms(opts);
     graph = buildGraph(atoms, opts);
+    builtOpts = opts;
     render(graph, opts);
     $("exportBtn").disabled = false;
     $("exportJsonBtn").disabled = false;
@@ -1549,18 +1554,59 @@ $("exportBtn").addEventListener("click", () => {
   download(header+rows, "pampano_edges.csv", "text/csv");
 });
 
+// Cytoscape.js JSON ({data, elements:{nodes, edges}}): opens in Cytoscape desktop
+// (File > Import > Network from File) and Cytoscape.js. Same layout and attribute
+// names as the offline tool's PREFIX.json (offline/pampano_offline.py).
+function cytoscapeJson(g, opts, sourceName) {
+  const N = g.nodes.length;
+  const deg = new Array(N).fill(0);
+  for (const l of g.links) { deg[idOf(l.source)]++; deg[idOf(l.target)]++; }
+  const atomMode = opts.granularity === "atom";
+  const sasaOn = opts.colorBy === "sasa" || opts.sizeBy === "sasa";
+  // drop null/undefined/NaN so Cytoscape doesn't make empty columns
+  const clean = o => { const r = {}; for (const [k,v] of Object.entries(o))
+    if (v !== null && v !== undefined && !(typeof v === "number" && Number.isNaN(v))) r[k] = v; return r; };
+  const nodes = g.nodes.map((n,k) => {
+    let x, y, z;
+    if (atomMode) { x = n.atomRef.x; y = n.atomRef.y; z = n.atomRef.z; }
+    else {      // centroid of the residue's selected atoms
+      const at = resAtomIndex.get(n.atomKey) || []; x = 0; y = 0; z = 0;
+      for (const a of at) { x += a.x; y += a.y; z += a.z; }
+      const c = Math.max(at.length, 1); x /= c; y /= c; z /= c;
+    }
+    const d = clean({id:String(k), name:n.title, label:n.label, chain:n.chain, base_chain:n.baseChain,
+      operator:n.opId ?? 0, copy:n.copyId ?? 0, res_name:n.resName, res_seq:n.resSeq, icode:n.iCode,
+      atom_name: atomMode ? n.atomRef.name : null, hetatm:!!n.hetatm, res_class:n.resclass,
+      hydropathy:n.hydro, volume:n.vol, sasa:n.sasa, rel_sasa:n.relsasa, degree:deg[k], x, y, z});
+    return {data:d, position:{x:x*10, y:y*10}};
+  });
+  const PC = ["bb-bb","bb-sc","bb-het","sc-bb","sc-sc","sc-het","het-bb","het-sc","het-het"];
+  const edges = g.links.map((l,e) => {
+    const s = idOf(l.source), t = idOf(l.target), pc = l.partCounts || {};
+    const d = clean({id:"e"+e, source:String(s), target:String(t),
+      name:`${g.nodes[s].title} (${l.type}) ${g.nodes[t].title}`, interaction:l.type, scope:l.scope,
+      distance:l.dist, count:l.count||1, is_bond:!!l.bond, source_part:l.sourcePart, target_part:l.targetPart,
+      part_counts:formatPartCounts(pc)});
+    for (const k of PC) if (pc[k]) d["pc_" + k.replace("-","_")] = pc[k];
+    return {data:d};
+  });
+  return {
+    format_version:"1.0", generated_by:"Pampano web app", target_cytoscapejs_version:"~2.1",
+    data:{name:`Pampano ${sourceName}`, shared_name:`Pampano ${sourceName}`, source:sourceName,
+      assembly_mode:opts.assemblyMode, granularity:opts.granularity, cutoff:opts.cutoff, atom_scope:opts.atomScope,
+      covalent_only:opts.covalentOnly, intra_chain:opts.intraChain, inter_chain:opts.interChain,
+      inter_protomer:opts.interProtomer, exclude_seq_adjacent:opts.excludeSeqAdj, include_hetatm:opts.includeHetatm,
+      protomer_groups:$("protomerGroups").value || "", sasa:sasaOn, edge_filter:"all",
+      symmetry_mate_atoms:g.meta.mateAtoms || 0, self_symmetry_atom_pairs:g.meta.selfSymPairs || 0},
+    elements:{nodes, edges}
+  };
+}
+
 $("exportJsonBtn").addEventListener("click", () => {
   if (!graph) return;
-  const clean = {
-    nodes: graph.nodes.map(n=>({id:n.id, label:n.label, chain:n.chain,
-      base_chain:n.baseChain, operator:n.opId, title:n.title,
-      resName:n.resName, hydropathy:n.hydro, volume:n.vol, sasa:n.sasa, degree:n.degree})),
-    links: graph.links.map(l=>({source:idOf(l.source), target:idOf(l.target),
-      distance:l.dist, count:l.count||1, interaction:l.type, scope:l.scope,
-      is_bond:!!l.bond, source_part:l.sourcePart, target_part:l.targetPart,
-      part_counts:l.partCounts}))
-  };
-  download(JSON.stringify(clean,null,2), "pampano_network.json", "application/json");
+  const stem = (loadedName || "pampano").replace(/\.gz$/i, "").replace(/\.[^.]+$/, "");
+  download(JSON.stringify(cytoscapeJson(graph, builtOpts, loadedName || "structure")),
+    `${stem}_${builtOpts.assemblyMode}_${builtOpts.granularity}.json`, "application/json");
 });
 
 function download(content, name, type) {
@@ -1620,7 +1666,7 @@ Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, io
 
 ## Exports
 - **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, covalent-bond flag, and backbone/sidechain/HETATM part of each partner (plus per-part atom-pair counts) per edge.
-- **JSON graph** — nodes (residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (distance, count, interaction, scope, bond flag, source/target part, part counts).
+- **JSON graph (Cytoscape)** — Cytoscape.js format: opens directly in Cytoscape desktop (File → Import → Network from File) and reads into Cytoscape.js, NetworkX, R, etc. Nodes carry residue name, chain, base chain, operator, hydropathy, volume, SASA, degree and x/y/z (nodes start at their structure positions); edges carry distance, count, interaction, scope, bond flag, source/target part and part counts. Same layout as the offline tool's JSON.
 
 ## Offline version (large structures)
 For capsids, large biological assemblies or big atom-level networks that are too heavy for the browser, the *offline/* folder of the Pampano repository has a command-line version (Python with numpy/scipy, with an optional form in your web browser). It reads PDB or mmCIF files, builds the same network as this page and writes a Cytoscape-ready JSON plus CSV edge and node tables for R.
