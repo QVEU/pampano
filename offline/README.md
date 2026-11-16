@@ -117,7 +117,7 @@ SASA is the slowest step: about 25 seconds for the 390,000 heavy atoms of the 3V
 
 **Node attributes:** `id`, `name` (e.g. `A GLY 1`, the label shown in Cytoscape), `label` (`GLY1`), `chain` (copy label: `A`, or `A_5` for BIOMT operator 5), `base_chain` (deposited chain), `operator` (BIOMT index), `copy` (distinguishes repeated residues with the same ID), `res_name`, `res_seq`, `icode`, `atom_name` (atom level only), `hetatm`, `res_class` (neg/pos/polar/hydrophobic/special/unknown), `hydropathy` (Kyte–Doolittle), `volume` (Å³), `sasa` and `rel_sasa` (with `--sasa`), `degree`, and `x`, `y`, `z` (residue centroid or atom position, Å).
 
-**Edge attributes:** `source`, `target`, `name`, `interaction` (peptide, disulfide, covalent, salt_bridge, hydrogen_bond, hydrophobic, vdw), `scope` (intra, intra_protomer, homotypic, heterotypic, inter_protomer), `distance` (closest atom pair, Å), `count` (atom pairs), `is_bond`, `source_part` / `target_part` (backbone, sidechain or hetatm: the parts of the atom pair that defines the interaction type), `part_counts` (e.g. `sc-sc:12;bb-sc:3`) and one `pc_<source>_<target>` count per part combination present (e.g. `pc_sc_sc`). See the web app's Help for definitions.
+**Edge attributes:** `source`, `target`, `name`, `interaction` (peptide, disulfide, covalent, salt_bridge, hydrogen_bond, hydrophobic, vdw), `scope` (intra, intra_protomer, homotypic, heterotypic, inter_protomer), `scopeAny`, `distance` (closest atom pair, Å), `count` (atom pairs), `is_bond`, `source_part` / `target_part` (backbone, sidechain or hetatm: the parts of the atom pair that defines the interaction type), `part_counts` (e.g. `sc-sc:12;bb-sc:3`) and one `pc_<source>_<target>` count per part combination present (e.g. `pc_sc_sc`). See the web app's Help for definitions.
 
 Missing values are left out rather than written as `null`, so Cytoscape does not create empty columns.
 
@@ -144,13 +144,14 @@ g.add_edges_from((e["data"]["source"], e["data"]["target"], e["data"]) for e in 
 | `distance` | closest atom pair, Å (2 decimals) |
 | `count` | number of atom pairs in contact |
 | `interaction` | strongest interaction type |
-| `scope` | structural scope |
+| `scope` | structural scope of the atom pair that defines `interaction` |
 | `is_bond` | 1 for covalent bonds (peptide, disulfide, covalent), else 0 |
 | `source_part`, `target_part` | backbone / sidechain / hetatm |
 | `part_counts` | atom pairs by part, largest first |
 
 followed by:
 
+- `scope_any`: the most notable structural scope among *all* the atom pairs the edge aggregates (ranked heterotypic > homotypic > inter_protomer > intra_protomer > intra), where `scope` describes only the pair that defines `interaction`. The two differ when a residue pair touches in more than one context: consecutive residues of one chain whose side chains also reach a neighbouring symmetry copy come out as `interaction` peptide, `scope` intra, `scope_any` inter_protomer. Group by `scope` to ask "what kind of contact is this"; filter on `scope_any` to find every residue pair that touches across an interface at all.
 - `pc_bb_bb`, `pc_bb_sc`, … `pc_het_het`: the same part counts as nine numeric columns (zero when absent), source part first.
 - `source_chain`, `source_base_chain`, `source_operator`, `source_res_name`, `source_res_seq`, `source_icode`, `source_hetatm`, `source_res_class`, and the same for `target_` (plus `atom_name` at atom level), so most analyses need no join.
 

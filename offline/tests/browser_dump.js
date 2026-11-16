@@ -30,7 +30,7 @@ const { chromium } = require('playwright');
         nodes: g.nodes.map(n => ({id:n.id, label:n.label, chain:n.chain, baseChain:n.baseChain, opId:n.opId, copyId:n.copyId,
           hetatm:n.hetatm, resName:n.resName, resSeq:Number.isNaN(n.resSeq)?null:n.resSeq, iCode:n.iCode, hydro:n.hydro, vol:n.vol,
           sasa:n.sasa, relsasa:n.relsasa, resclass:n.resclass, title:n.title})),
-        links: g.links.map(l => ({source:l.source, target:l.target, dist:l.dist, count:l.count||1, type:l.type, scope:l.scope,
+        links: g.links.map(l => ({source:l.source, target:l.target, dist:l.dist, count:l.count||1, type:l.type, scope:l.scope, scopeAny:l.scopeAny,
           bond:!!l.bond, sourcePart:l.sourcePart, targetPart:l.targetPart, partCounts:l.partCounts})),
         meta: {mateAtoms: g.meta.mateAtoms||0, selfSymPairs: g.meta.selfSymPairs||0} };
     }, c);
