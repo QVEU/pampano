@@ -56,7 +56,7 @@ Click any node to open a structural view (bottom-left) of that residue and the r
 
 ## Exports
 
-- **CSV edge list** — one row per edge: node indices and labels, minimum distance, atom-pair count, interaction type, scope, whether it is a covalent bond, `source_part` / `target_part` (backbone, sidechain or hetatm for each partner) and `part_counts`.
+- **CSV edge list** — one row per edge: node indices and labels, minimum distance, atom-pair count, interaction type, scope, whether it is a covalent bond, `source_part` / `target_part` (backbone, sidechain or hetatm for each partner), `part_counts` and `scope_any`.
 - **JSON graph** — nodes (with per-node properties: residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (with distance, count, interaction, scope, bond flag, source/target part, part counts).
 
 ## Offline version (large structures)
@@ -75,6 +75,12 @@ For capsids, large biological assemblies or big atom-level networks that are too
   - **Heterotypic** — the two chains have *different* sequences (different proteins — a true hetero-complex interface).
 - **Intra-protomer** — The two chains belong to the *same* manually defined protomer group (set via **Protomer groups**). Represents an interface internal to a multi-chain protomer.
 - **Inter-protomer** — The two atoms are the same original chain under *different* BIOMT symmetry operators (e.g. A and A′). These interfaces exist only once the biological assembly is built. Only appears in the two biological-assembly modes.
+
+#### `scope` and `scope_any`
+
+A residue-level edge aggregates every atom-atom contact between two residues, and those contacts need not share a scope. The edge's **`scope`** is the scope of the atom pair that defines its **interaction type** (the closest pair of the strongest type), so the two labels always describe the same physical contact. **`scope_any`** is the most notable scope among *all* the contributing pairs, ranked intra < intra-protomer < inter-protomer < homotypic < heterotypic.
+
+They differ when a residue pair touches in more than one context. Two consecutive residues of a chain whose side chains also reach a neighbouring symmetry copy give `interaction` = peptide, `scope` = intra (the backbone bond is internal) and `scope_any` = inter-protomer (they do also meet across the interface). Group by `scope` when asking what kind of contact something is; use `scope_any` to find every residue pair that touches across an interface at all.
 
 > **Why both homotypic/heterotypic and intra/inter-protomer?** Chain labels (A, B, C…) are assigned by whoever deposited the structure and don't inherently tell you which chains form one functional unit. Pampano classifies inter-chain contacts automatically by sequence identity (which is unambiguous within a single structure), and lets you override that with explicit protomer groups when the biological grouping is something only you know.
 

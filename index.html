@@ -469,8 +469,10 @@ function buildContacts(atoms, cutoff) {
   return pairs;
 }
 
-// when a residue edge aggregates atom pairs of differing scope, keep the most
-// "notable" one (interface contacts rank above internal ones)
+// `scope_any` keeps the most "notable" scope among all atom pairs an edge
+// aggregates (interface contacts rank above internal ones). The edge's own
+// `scope` follows the atom pair that defines its interaction type, so the two
+// labels always describe the same contact.
 const SCOPE_RANK = ["heterotypic","homotypic","inter_protomer","intra_protomer","intra"];
 function mergeScoperank(a, b) {
   if (!a) return b; if (!b) return a;
@@ -830,10 +832,12 @@ function buildGraph(atoms, opts) {
       if (!prev) { atomLinks.set(k, cur); continue; }
       const won = strongerInteraction(prev.type, cur.type);
       const keep = won === prev.type && (won !== cur.type || prev.d <= cur.d) ? prev : cur;
-      atomLinks.set(k, {...keep, d: Math.min(prev.d, cur.d), scope: mergeScoperank(prev.scope, cur.scope), bond: prev.bond || cur.bond});
+      atomLinks.set(k, {...keep, d: Math.min(prev.d, cur.d),
+        scopeAny: mergeScoperank(prev.scopeAny || prev.scope, cur.scope), bond: prev.bond || cur.bond});
     }
     links = [...atomLinks.values()].map(c => ({source:c.i, target:c.j, dist:c.d,
-      type:c.type, scope:c.scope, inter:c.scope !== "intra", bond:c.bond,
+      type:c.type, scope:c.scope, scopeAny:c.scopeAny || c.scope,
+      inter:(c.scopeAny || c.scope) !== "intra", bond:c.bond,
       sourcePart:c.pi, targetPart:c.pj, partCounts:{[`${PART_ABBR[c.pi]}-${PART_ABBR[c.pj]}`]:1}}));
   } else {
     // residue-level: collapse atom pairs to residue-residue edges
@@ -849,10 +853,11 @@ function buildGraph(atoms, opts) {
     const resList = [...resMap.values()];
     const resIndex = new Map(resList.map((r,i)=>[r.key,i]));
 
-    // strongest interaction and most notable scope label each aggregated edge.
-    // sourcePart/targetPart come from the atom pair that defines the edge's type
-    // (the closest pair of the winning type); partCounts tallies every atom pair
-    // by "source-target" part, e.g. {"bb-sc": 3, "sc-sc": 12}.
+    // the strongest interaction labels each aggregated edge. scope and
+    // sourcePart/targetPart all come from the atom pair that defines that type
+    // (the closest pair of the winning type), so they describe one contact;
+    // scopeAny keeps the most notable scope over every pair. partCounts tallies
+    // every atom pair by "source-target" part, e.g. {"bb-sc": 3, "sc-sc": 12}.
     const edgeAgg = new Map(); // "lo-hi" -> edge
     for (const c of contacts) {
       const ri = resIndex.get(residueKey(sel[home[c.i]])), rj = resIndex.get(residueKey(sel[home[c.j]]));
@@ -861,7 +866,7 @@ function buildGraph(atoms, opts) {
       const lo = Math.min(ri,rj), hi = Math.max(ri,rj), ek = lo+"-"+hi;
       let e = edgeAgg.get(ek);
       if (!e) edgeAgg.set(ek, e = {source:lo, target:hi, dist:Infinity, count:0,
-        type:null, scope:null, inter:false, bond:false,
+        type:null, scope:null, scopeAny:null, inter:false, bond:false,
         sourcePart:null, targetPart:null, typeDist:Infinity, partCounts:{}});
       // orient the atom pair's parts to the edge's source (lo) / target (hi)
       const [ps, pt] = ri === lo ? [c.pi, c.pj] : [c.pj, c.pi];
@@ -871,11 +876,11 @@ function buildGraph(atoms, opts) {
       e.dist = Math.min(e.dist, c.d);
       const won = strongerInteraction(e.type, c.type);
       if (e.type === null || (won === c.type && won !== e.type) || (c.type === e.type && c.d < e.typeDist)) {
-        e.sourcePart = ps; e.targetPart = pt; e.typeDist = c.d;
+        e.sourcePart = ps; e.targetPart = pt; e.typeDist = c.d; e.scope = c.scope;
       }
       e.type = won;
-      e.scope = mergeScoperank(e.scope, c.scope);
-      e.inter = e.scope !== "intra";
+      e.scopeAny = mergeScoperank(e.scopeAny, c.scope);
+      e.inter = e.scopeAny !== "intra";
       e.bond = e.bond || c.bond;
     }
     const edges = [...edgeAgg.values()];
@@ -1538,13 +1543,13 @@ d3.select("#graph").on("click", () => {
 
 $("exportBtn").addEventListener("click", () => {
   if (!graph) return;
-  const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond,source_part,target_part,part_counts\n";
+  const header = "source,target,source_label,target_label,distance,count,interaction,scope,is_bond,source_part,target_part,part_counts,scope_any\n";
   const rows = graph.links.map(l => {
     const s = graph.nodes[idOf(l.source)], t = graph.nodes[idOf(l.target)];
     return [s.id, t.id, s.title, t.title,
       (typeof l.dist==="number") ? l.dist.toFixed(2) : l.dist,
       l.count||1, l.type, l.scope, l.bond?1:0,
-      l.sourcePart, l.targetPart, formatPartCounts(l.partCounts)].join(",");
+      l.sourcePart, l.targetPart, formatPartCounts(l.partCounts), l.scopeAny || l.scope].join(",");
   }).join("\n");
   download(header+rows, "pampano_edges.csv", "text/csv");
 });
@@ -1619,7 +1624,7 @@ Click any node to open a structural view of that residue and the residues it con
 Polymer residues are drawn as **circles**; HETATM groups (ligands, cofactors, ions, water) are drawn as **squares** with a light outline, so non-polymer components stand out. HETATM nodes appear only when **Include HETATM** is on, and carry no hydropathy/volume/SASA values (they fall back to a neutral color under those coloring modes).
 
 ## Exports
-- **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, covalent-bond flag, and backbone/sidechain/HETATM part of each partner (plus per-part atom-pair counts) per edge.
+- **CSV edge list** — node indices and labels, minimum distance, atom-pair count, interaction type, scope, covalent-bond flag, backbone/sidechain/HETATM part of each partner (plus per-part atom-pair counts), and @scope_any@ per edge. @scope@ describes the atom pair that defines the interaction type; @scope_any@ is the most notable scope among all the atom pairs the edge aggregates, so an internal backbone bond between residues that also touch across an interface reads as @peptide@ / @intra@ / @inter_protomer@.
 - **JSON graph** — nodes (residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (distance, count, interaction, scope, bond flag, source/target part, part counts).
 
 ## Offline version (large structures)
