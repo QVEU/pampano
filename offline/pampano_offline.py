@@ -1036,13 +1036,15 @@ def build_graph(atoms, opts, verbose=True):
             win[cur_g] = kept
         dist = np.full(E, np.inf)
         np.minimum.at(dist, g, pd2)
-        scp = np.full(E, 99, np.int64)
-        np.minimum.at(scp, g, sc2)
+        scp_any = np.full(E, 99, np.int64)
+        np.minimum.at(scp_any, g, sc2)
+        scp = sc2[win]
         bnd = np.zeros(E, bool)
         np.logical_or.at(bnd, g, bd2)
         links = {
             "source": s[win], "target": t[win], "dist": dist, "count": np.ones(E, np.int64),
-            "type": best_t, "scope": scp, "bond": bnd, "sourcePart": pa[win], "targetPart": pb[win],
+            "type": best_t, "scope": scp, "scopeAny": scp_any, "bond": bnd,
+            "sourcePart": pa[win], "targetPart": pb[win],
             "partCounts": None, "partPair": pa[win] * 3 + pb[win],
         }
         nodes = _atom_nodes(sel, prim_idx, atom_sasa)
@@ -1094,8 +1096,9 @@ def build_graph(atoms, opts, verbose=True):
         mind_bt = np.full(E, np.inf)
         np.minimum.at(mind_bt, g, np.where(is_bt, pd2, np.inf))
         win = _first_per_group(g, E, is_bt & (pd2 == mind_bt[g]))
-        scp = np.full(E, 99, np.int64)
-        np.minimum.at(scp, g, sc2)
+        scp_any = np.full(E, 99, np.int64)
+        np.minimum.at(scp_any, g, sc2)
+        scp = sc2[win]
         bnd = np.zeros(E, bool)
         np.logical_or.at(bnd, g, bd2)
         pk = ps * 3 + pt
@@ -1110,7 +1113,8 @@ def build_graph(atoms, opts, verbose=True):
         remap = np.cumsum(used) - 1
         links = {
             "source": remap[src], "target": remap[tgt], "dist": dist, "count": cnt,
-            "type": best_t, "scope": scp, "bond": bnd, "sourcePart": ps[win], "targetPart": pt[win],
+            "type": best_t, "scope": scp, "scopeAny": scp_any, "bond": bnd,
+            "sourcePart": ps[win], "targetPart": pt[win],
             "partCounts": pc, "partFirst": pc_first,
         }
         nodes = _residue_nodes(sel, [res_first[r] for r in np.nonzero(used)[0]],
@@ -1261,6 +1265,7 @@ def write_outputs(g, opts, out_prefix, source_name, edge_filter="all", position_
     deg = np.bincount(src, minlength=N) + np.bincount(tgt, minlength=N)
     tnames = np.array(INTERACTION_PRIORITY, dtype=object)[links["type"][eidx]]
     snames = np.array(SCOPE_RANK, dtype=object)[links["scope"][eidx]]
+    sanames = np.array(SCOPE_RANK, dtype=object)[links["scopeAny"][eidx]]
     pnames = np.array(PARTS, dtype=object)
     spart = pnames[links["sourcePart"][eidx]]
     tpart = pnames[links["targetPart"][eidx]]
@@ -1340,7 +1345,7 @@ def write_outputs(g, opts, out_prefix, source_name, edge_filter="all", position_
         # ---- edges: JSON + CSV in one pass ----
         edges_path = out_prefix + "_edges.csv"
         ecols = ["source", "target", "source_label", "target_label", "distance", "count", "interaction", "scope",
-                 "is_bond", "source_part", "target_part", "part_counts"]
+                 "is_bond", "source_part", "target_part", "part_counts", "scope_any"]
         with open(edges_path, "w", newline="") as ef:
             ew = csv.writer(ef)
             ew.writerow(ecols + ["pc_" + k for k in pc_keys] +
@@ -1353,7 +1358,7 @@ def write_outputs(g, opts, out_prefix, source_name, edge_filter="all", position_
                      "name": "%s (%s) %s" % (titles[s], typ, titles[t]),
                      "interaction": typ, "scope": snames[n], "distance": float(dist[n]), "count": int(cnt[n]),
                      "is_bond": bool(bond[n]), "source_part": spart[n], "target_part": tpart[n],
-                     "part_counts": pc_str[n]}
+                     "part_counts": pc_str[n], "scope_any": sanames[n]}
                 row = pc_mat[n]
                 for q in range(9):
                     if row[q]:
@@ -1364,7 +1369,7 @@ def write_outputs(g, opts, out_prefix, source_name, edge_filter="all", position_
                 jf.write(dumps(d))
                 jf.write("}")
                 ew.writerow([s, t, titles[s], titles[t], "%.2f" % dist[n], int(cnt[n]), typ, snames[n],
-                             1 if bond[n] else 0, spart[n], tpart[n], pc_str[n]] + row.tolist() +
+                             1 if bond[n] else 0, spart[n], tpart[n], pc_str[n], sanames[n]] + row.tolist() +
                             node_attr_cache[s] + node_attr_cache[t])
         jf.write("]}}")
     return json_path, edges_path, nodes_path
@@ -1400,6 +1405,7 @@ def browser_style_graph(g):
             "source": int(links["source"][e]), "target": int(links["target"][e]),
             "dist": float(links["dist"][e]), "count": int(links["count"][e]),
             "type": INTERACTION_PRIORITY[int(links["type"][e])], "scope": SCOPE_RANK[int(links["scope"][e])],
+            "scopeAny": SCOPE_RANK[int(links["scopeAny"][e])],
             "bond": bool(links["bond"][e]),
             "sourcePart": PARTS[int(links["sourcePart"][e])], "targetPart": PARTS[int(links["targetPart"][e])],
             "partCounts": dict(part_counts_list(links, e)),
