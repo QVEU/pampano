@@ -57,7 +57,7 @@ Click any node to open a structural view (bottom-left) of that residue and the r
 ## Exports
 
 - **CSV edge list** — one row per edge: node indices and labels, minimum distance, atom-pair count, interaction type, scope, whether it is a covalent bond, `source_part` / `target_part` (backbone, sidechain or hetatm for each partner), `part_counts` and `scope_any`.
-- **JSON graph** — nodes (with per-node properties: residue name, hydropathy, volume, SASA, degree, chain, base chain, operator) and links (with distance, count, interaction, scope, bond flag, source/target part, part counts).
+- **JSON graph (Cytoscape)** — Cytoscape.js format: opens directly in Cytoscape desktop (File → Import → Network from File) and reads into Cytoscape.js, NetworkX, R, etc. Nodes carry residue name, chain, base chain, operator, hydropathy, volume, SASA, degree and x/y/z (nodes start at their structure positions); edges carry distance, count, interaction, scope, scope_any, bond flag, source/target part and part counts. Same layout as the offline tool's JSON (see [offline/README.md](offline/README.md#json-cytoscapejs) for every attribute).
 
 ## Offline version (large structures)
 
