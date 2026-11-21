@@ -1,0 +1,4 @@
+-r requirements.txt
+networkx>=3.4,<4
+pandas>=2.2,<3
+gemmi>=0.7,<0.8

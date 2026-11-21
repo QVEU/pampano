@@ -1,5 +1,8 @@
 # Pampano offline
 
+For total-network analysis, ligand/RNA contact paths, protein interfaces, batch
+runs, and structure score coloring, see [NetworkX analysis](NETWORK_ANALYSIS.md).
+
 A command-line version of Pampano for structures that are too big for the browser: virus capsids, large biological assemblies, atom-level networks of big complexes. It builds **the same network as the web app** (same PDB parsing, BIOMT handling, assembly modes, atom selection, contact search, interaction types, scope labels, backbone/sidechain partners and SASA) and writes it to files instead of drawing it:
 
 | File | What it is | Open it with |
