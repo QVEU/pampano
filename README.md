@@ -2,6 +2,8 @@
 
 **Pampano** generates a network of contacts and bonds from a protein structure (PDB file). Each node is a residue (or atom), and each edge is a physical interaction between them — a covalent bond, a hydrogen bond, a salt bridge, a hydrophobic contact, and so on. It runs entirely in your browser; nothing is uploaded to a server.
 
+Webapp: [https://qveu.github.io/pampano/](https://qveu.github.io/pampano/)
+
 ---
 
 ## Quick start
