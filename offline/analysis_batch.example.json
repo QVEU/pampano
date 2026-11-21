@@ -1,0 +1,8 @@
+{
+  "jobs": [
+    {"id":"3VBS", "pdb_id":"3VBS", "ligands":["SPH"]},
+    {"id":"6CVB", "pdb_id":"6CVB", "ligands":["SIA"]},
+    {"id":"9DTT", "pdb_id":"9DTT", "partner_chains":["B"], "ligand_group":"chain", "betweenness_sources":100000},
+    {"id":"8T12", "pdb_id":"8T12", "interface_left":["B"], "interface_right":["A"], "betweenness_sources":100000}
+  ]
+}
