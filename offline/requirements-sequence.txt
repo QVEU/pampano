@@ -1,0 +1,5 @@
+-r requirements-analysis.txt
+scipy>=1.11,<2
+# Optional alignment acquisition/preparation in the accompanying study bundle:
+# biopython==1.88
+# pyfamsa==0.7.0

@@ -1,5 +1,7 @@
 # Total networks, binding partners, and structural score maps
 
+For conservation and SCA comparisons, see [SEQUENCE_COMPARISON.md](SEQUENCE_COMPARISON.md).
+
 `analyze_structure.py` adds NetworkX analysis and interactive structure coloring
 to the existing Pampano offline contact builder. The contact builder and its
 interaction definitions are unchanged. Python 3.10+ is recommended.
